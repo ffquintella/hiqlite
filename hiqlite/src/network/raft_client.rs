@@ -169,6 +169,28 @@ enum WritePayload {
     Close,
 }
 
+/// Aborts the wrapped task when dropped.
+///
+/// Tokio `JoinHandle`s only *detach* their task on drop, they do not abort it.
+/// `ws_handler` spawns the `stream_reader` / `stream_writer` tasks and holds
+/// their handles across the inner loop's `.await` points. When the owning
+/// `NetworkConnectionStreaming` is dropped (openraft rebuilds the client for a
+/// target) its `Drop` calls `task.abort()` on the parent `ws_handler` task.
+/// Aborting the parent drops these handles, which — being plain `JoinHandle`s —
+/// would *detach* the reader/writer instead of stopping them. The detached
+/// tasks keep the upgraded WebSocket's split socket halves alive, so the TCP
+/// connection is never closed and leaks as an `ESTABLISHED` socket on both
+/// peers. Under replication churn this exhausts the ephemeral port range and
+/// breaks Raft quorum. Binding the abort to scope guarantees teardown on every
+/// drop path (clean break, parent abort, or panic).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[allow(clippy::type_complexity)]
 impl NetworkStreaming {
     #[allow(clippy::too_many_arguments)]
@@ -274,8 +296,13 @@ impl NetworkStreaming {
             // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
             let read = FragmentCollectorRead::new(read);
 
-            let handle_read = task::spawn(Box::pin(Self::stream_reader(read, tx_read.clone())));
-            let handle_write = task::spawn(Box::pin(Self::stream_writer(write, rx_write)));
+            // Wrapped in `AbortOnDrop` so that aborting/dropping `ws_handler`
+            // tears these down too (see `AbortOnDrop` docs) instead of leaking
+            // the socket.
+            let handle_read =
+                AbortOnDrop(task::spawn(Box::pin(Self::stream_reader(read, tx_read.clone()))));
+            let handle_write =
+                AbortOnDrop(task::spawn(Box::pin(Self::stream_writer(write, rx_write))));
 
             loop {
                 let res = select! {
@@ -381,8 +408,11 @@ impl NetworkStreaming {
             // Since we need to re-connect, there is no need to rush anyway.
             time::sleep(Duration::from_millis(250)).await;
 
-            handle_write.abort();
-            handle_read.abort();
+            // Dropping the guards aborts the reader/writer tasks, which drops
+            // the split socket halves and closes the TCP connection before we
+            // reconnect (or exit).
+            drop(handle_write);
+            drop(handle_read);
 
             if shutdown {
                 break;
