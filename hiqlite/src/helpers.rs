@@ -125,6 +125,24 @@ pub async fn change_membership(
     }
 }
 
+/// Trigger an immediate leader election on the local Raft node.
+pub async fn trigger_elect(state: &Arc<AppState>, raft_type: &RaftType) -> Result<(), Error> {
+    info!("Triggering {:?} Raft election on this node", raft_type);
+    match raft_type {
+        #[cfg(feature = "sqlite")]
+        RaftType::Sqlite => {
+            state.raft_db.raft.trigger().elect().await?;
+            Ok(())
+        }
+        #[cfg(feature = "cache")]
+        RaftType::Cache => {
+            state.raft_cache.raft.trigger().elect().await?;
+            Ok(())
+        }
+        RaftType::Unknown => panic!("neither `sqlite` nor `cache` feature enabled"),
+    }
+}
+
 pub async fn remove_learner(
     state: &Arc<AppState>,
     raft_type: &RaftType,

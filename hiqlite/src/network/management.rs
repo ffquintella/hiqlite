@@ -165,6 +165,43 @@ pub(crate) async fn become_member(
     }
 }
 
+/// Force a leader change by triggering an election takeover on this node.
+///
+/// openraft 0.9 has no leader-side step-down API, so a step-down is driven
+/// from the other direction: a FOLLOWER calling `Raft::trigger().elect()`
+/// starts an election with a higher term, which the current leader observes
+/// and yields to. This handler must therefore be called on a follower;
+/// calling it on the current leader is rejected.
+#[tracing::instrument(skip_all)]
+pub(crate) async fn step_down(
+    state: AppStateExt,
+    headers: HeaderMap,
+    Path(raft_type): Path<RaftType>,
+) -> Result<Response, Error> {
+    validate_secret(&state, &headers)?;
+
+    if helpers::is_raft_stopped(&state, &raft_type)
+        || !helpers::is_raft_initialized(&state, &raft_type).await?
+    {
+        return Err(Error::Error("Raft is not initialized".into()));
+    }
+
+    if helpers::get_raft_leader(&state, &raft_type).await == Some(state.id) {
+        return Err(Error::Config(
+            "step_down must be called on a follower, which then takes over \
+             leadership by starting a new election"
+                .into(),
+        ));
+    }
+
+    info!(
+        "Election takeover requested on node {} ({:?})",
+        state.id, raft_type
+    );
+    helpers::trigger_elect(&state, &raft_type).await?;
+    fmt_ok(headers, ())
+}
+
 async fn are_we_leader(state: &AppStateExt, raft_type: &RaftType) -> Result<(), Error> {
     if let Some(leader_id) = helpers::get_raft_leader(state, raft_type).await {
         if leader_id == state.id {
