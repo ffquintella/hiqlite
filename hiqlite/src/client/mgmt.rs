@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "cache")]
 use crate::network::management::{self, ClusterLeaveReq};
@@ -222,6 +222,27 @@ impl Client {
     ) -> Result<(), Error> {
         info!("Starting Node shutdown");
 
+        // Repeat shutdowns must be no-ops. An explicit `shutdown()` (e.g. a
+        // graceful cluster leave) followed by another one (e.g. from an
+        // embedding application's drop/exit path) would otherwise re-send
+        // shutdown requests to writers that are already gone and panic on
+        // their `expect`s below.
+        #[allow(unused_mut, unused_assignments)]
+        let mut all_stopped = true;
+        #[cfg(feature = "sqlite")]
+        {
+            all_stopped = state.raft_db.is_raft_stopped.load(Ordering::Relaxed);
+        }
+        #[cfg(feature = "cache")]
+        {
+            all_stopped =
+                all_stopped && state.raft_cache.is_raft_stopped.load(Ordering::Relaxed);
+        }
+        if all_stopped {
+            info!("Node shutdown has already been executed - skipping");
+            return Ok(());
+        }
+
         #[allow(unused_mut)]
         let mut is_single_instance: bool;
         #[cfg(feature = "cache")]
@@ -372,8 +393,13 @@ impl Client {
         }
 
         if let Some(tx) = tx_shutdown {
-            tx.send(true)
-                .expect("The global Hiqlite shutdown handler to always listen");
+            // A send error means every receiver (the graceful-shutdown watchers
+            // of the API / internal HTTP servers) is already gone. At this
+            // point the Raft and all writers have shut down cleanly, so there
+            // is nothing left to notify — not a reason to panic.
+            if tx.send(true).is_err() {
+                warn!("Global Hiqlite shutdown handler no longer listening");
+            }
         }
 
         info!("Shutdown complete");
