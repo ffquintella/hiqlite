@@ -49,7 +49,12 @@ console-subscriber = "0.5.0"
 crc = "3.3.0"
 cron = { version = "0.17" }
 crossbeam = "0.8.4"
-cryptr = { version = "0.10", features = ["s3"] }
+# `s3` is NOT requested here: every `cryptr::stream::s3` / `EncKeys` use in
+# this crate is already cfg-gated behind `s3`/`backup`/`dashboard`, but
+# requesting the feature unconditionally dragged `s3-simple` -> `quick-xml
+# 0.39` into every consumer's tree (RUSTSEC-2026-0194/0195) even for builds
+# with no S3 support. The `s3` feature now pulls `cryptr/s3` itself.
+cryptr = { version = "0.10", default-features = false }
 ctrlc = { version = "3.4.4", features = ["termination"] }
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }
 dotenvy = "0.15.7"

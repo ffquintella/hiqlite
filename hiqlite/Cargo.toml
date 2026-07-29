@@ -65,7 +65,7 @@ listen_notify_local = [
 ]
 macros = ["dep:hiqlite-derive"]
 toml = ["dep:toml"]
-s3 = ["backup"]
+s3 = ["backup", "cryptr/s3"]
 server = [
     "dep:clap",
     "dep:home",
