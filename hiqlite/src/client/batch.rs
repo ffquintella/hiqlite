@@ -1,3 +1,4 @@
+use crate::client::helpers::await_channel_response;
 use crate::client::stream::{ClientBatchPayload, ClientStreamReq};
 use crate::network::api::ApiStreamResponsePayload;
 use crate::store::state_machine::sqlite::state_machine::QueryWrite;
@@ -60,11 +61,7 @@ impl Client {
         sql: Cow<'static, str>,
     ) -> Result<Vec<Result<usize, Error>>, Error> {
         if let Some(state) = self.is_leader_db_with_state().await {
-            let res = state
-                .raft_db
-                .raft
-                .client_write(QueryWrite::Batch(sql))
-                .await?;
+            let res = Self::client_write_local(&state.raft_db.raft, QueryWrite::Batch(sql)).await?;
             let resp: Response = res.data;
             match resp {
                 Response::Batch(res) => res.result,
@@ -81,9 +78,7 @@ impl Client {
                 }))
                 .await
                 .map_err(|err| Error::Error(err.to_string().into()))?;
-            let res = rx
-                .await
-                .expect("To always receive an answer from Client Stream Manager")?;
+            let res = await_channel_response(rx).await??;
             match res {
                 ApiStreamResponsePayload::Batch(res) => res,
                 _ => unreachable!(),

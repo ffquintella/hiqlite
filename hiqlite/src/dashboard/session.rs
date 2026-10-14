@@ -8,6 +8,7 @@ use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, Method, request};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::CookieJar;
+use bincode_next::{Decode, Encode};
 use chrono::Utc;
 use cryptr::EncValue;
 use cryptr::utils::{b64_decode, b64_encode};
@@ -27,7 +28,7 @@ pub static INSECURE_COOKIES: LazyLock<bool> = LazyLock::new(|| {
         .expect("Cannot parse HQL_INSECURE_COOKIE as bool")
 });
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub(crate) struct Session {
     created: i64,
     expires: i64,
@@ -76,7 +77,9 @@ impl Session {
         let cookie_header = if *INSECURE_COOKIES {
             format!("{COOKIE_NAME_DEV}={b64}; HttpOnly; SameSite=Lax; Max-Age={max_age}")
         } else {
-            format!("{COOKIE_NAME}={b64}; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}; Path=/")
+            format!(
+                "{COOKIE_NAME}={b64}; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}; Path=/"
+            )
         };
 
         Ok(cookie_header)
@@ -125,11 +128,12 @@ pub async fn set_session_verify(
     password: String,
 ) -> Result<Response, Error> {
     check_csrf(&method, headers).await?;
+    // Reject login attempts during the global cooldown before any password work.
     if let Some(pwd) = state.dashboard.password_dashboard.clone() {
         password::verify_password(password, pwd).await?;
-
         let session = Session::new();
         let cookie = session.as_cookie()?;
+
         Ok(([(SET_COOKIE, cookie)], Json(session)).into_response())
     } else {
         Err(Error::Unauthorized("unauthorized".into()))

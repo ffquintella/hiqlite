@@ -1,7 +1,7 @@
+use crate::client::helpers::await_channel_response;
 use crate::client::stream::{ClientKVPayload, ClientStreamReq};
-use crate::helpers::deserialize;
+use crate::helpers::{deserialize_serde, serialize_serde};
 use crate::network::api::ApiStreamResponsePayload;
-use crate::network::serialize_network;
 use crate::store::state_machine::memory::kv_handler::CacheRequestHandler;
 use crate::store::state_machine::memory::state_machine::{CacheRequest, CacheResponse};
 use crate::{CacheVariants, Client, Error};
@@ -82,7 +82,7 @@ impl Client {
         match self.get_bytes(cache, key).await {
             Ok(value) => {
                 if let Some(v) = value {
-                    Ok(Some(deserialize(&v)?))
+                    Ok(Some(deserialize_serde(&v)?))
                 } else {
                     Ok(None)
                 }
@@ -106,11 +106,12 @@ impl Client {
                 .tx_caches
                 .get(cache.hiqlite_cache_index())
                 .unwrap()
-                .send(CacheRequestHandler::Get((key.into(), ack)))
+                .send(CacheRequestHandler::Get {
+                    key: key.into(),
+                    reply: ack,
+                })
                 .expect("kv handler to always be running");
-            let value = rx
-                .await
-                .expect("to always get an answer from the kv handler");
+            let value = await_channel_response(rx).await?;
             Ok(value)
         } else {
             let res = self
@@ -146,15 +147,13 @@ impl Client {
                 .tx_caches
                 .get(cache.hiqlite_cache_index())
                 .unwrap()
-                .send(CacheRequestHandler::SnapshotBuildCacheOnly(ack))
+                .send(CacheRequestHandler::SnapshotBuildCacheOnly { reply: ack })
                 .expect("kv handler to always be running");
-            let snapshot = rx
-                .await
-                .expect("to always get an answer from the kv handler");
+            let snapshot = await_channel_response(rx).await?;
 
             let mut res = BTreeMap::new();
             for (k, v) in snapshot {
-                res.insert(k, deserialize(&v)?);
+                res.insert(k, deserialize_serde(&v)?);
             }
             Ok(res)
         } else {
@@ -193,10 +192,14 @@ impl Client {
         K: Into<Cow<'static, str>>,
         V: Serialize,
     {
-        self.rate_limit_cache().await?;
-
-        self.put_bytes(cache, key, serialize_network(value), ttl)
-            .await?;
+        // `put_bytes` below applies the cache rate limit itself
+        self.put_bytes(
+            cache,
+            key,
+            serialize_serde(value).expect("Network payload serialization should always succeed"),
+            ttl,
+        )
+        .await?;
         Ok(())
     }
 
@@ -219,7 +222,11 @@ impl Client {
                 cache_idx: cache.hiqlite_cache_index(),
                 key: key.into(),
                 value,
-                expires: ttl.map(|seconds| Utc::now().timestamp().saturating_add(seconds)),
+                expires: ttl.map(|seconds| {
+                    Utc::now()
+                        .timestamp_micros()
+                        .saturating_add(seconds.saturating_mul(1_000_000))
+                }),
             },
             false,
         )
@@ -248,6 +255,125 @@ impl Client {
         Ok(())
     }
 
+    /// GET and REMOVE a value from the cache in one atomic step.
+    ///
+    /// Of several concurrent `get_remove` calls for the same key, exactly one
+    /// returns the value; all others get `None`.
+    pub async fn get_remove<C, K, V>(&self, cache: C, key: K) -> Result<Option<V>, Error>
+    where
+        C: CacheVariants,
+        K: Into<Cow<'static, str>>,
+        V: for<'a> Deserialize<'a>,
+    {
+        // `get_remove_bytes` below applies the cache rate limit itself
+        match self.get_remove_bytes(cache, key).await {
+            Ok(value) => {
+                if let Some(v) = value {
+                    Ok(Some(deserialize_serde(&v)?))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// GET and REMOVE a raw bytes value from the cache in one atomic step.
+    ///
+    /// Works in the same way as `.get_remove()` without any value mapping.
+    pub async fn get_remove_bytes<C, K>(&self, cache: C, key: K) -> Result<Option<Vec<u8>>, Error>
+    where
+        C: CacheVariants,
+        K: Into<Cow<'static, str>>,
+    {
+        self.rate_limit_cache().await?;
+
+        let res = self
+            .cache_req_retry(
+                CacheRequest::GetRemove {
+                    cache_idx: cache.hiqlite_cache_index(),
+                    key: key.into(),
+                },
+                false,
+            )
+            .await?;
+        match res {
+            CacheResponse::Value(opt) => Ok(opt),
+            _ => unreachable!(),
+        }
+    }
+
+    /// REPLACE a value in the cache and return the previous value (if the key existed).
+    /// The optional `ttl` is the lifetime of the value in seconds from *now* on.
+    pub async fn replace<C, K, V>(
+        &self,
+        cache: C,
+        key: K,
+        value: &V,
+        ttl: Option<i64>,
+    ) -> Result<Option<V>, Error>
+    where
+        C: CacheVariants,
+        K: Into<Cow<'static, str>>,
+        V: Serialize + for<'a> Deserialize<'a>,
+    {
+        // `replace_bytes` below applies the cache rate limit itself
+        match self
+            .replace_bytes(
+                cache,
+                key,
+                serialize_serde(value)
+                    .expect("Network payload serialization should always succeed"),
+                ttl,
+            )
+            .await
+        {
+            Ok(value) => {
+                if let Some(v) = value {
+                    Ok(Some(deserialize_serde(&v)?))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// REPLACE a raw bytes value in the cache and return the previous value.
+    pub async fn replace_bytes<C, K>(
+        &self,
+        cache: C,
+        key: K,
+        value: Vec<u8>,
+        ttl: Option<i64>,
+    ) -> Result<Option<Vec<u8>>, Error>
+    where
+        C: CacheVariants,
+        K: Into<Cow<'static, str>>,
+    {
+        self.rate_limit_cache().await?;
+
+        let res = self
+            .cache_req_retry(
+                CacheRequest::Replace {
+                    cache_idx: cache.hiqlite_cache_index(),
+                    key: key.into(),
+                    value,
+                    expires: ttl.map(|seconds| {
+                        Utc::now()
+                            .timestamp_micros()
+                            .saturating_add(seconds.saturating_mul(1_000_000))
+                    }),
+                },
+                false,
+            )
+            .await?;
+        match res {
+            CacheResponse::Value(opt) => Ok(opt),
+            _ => unreachable!(),
+        }
+    }
+
     /// Get the current counter value for the Cache + Key
     #[cfg(feature = "counters")]
     pub async fn counter_get<C, K>(&self, cache: C, key: K) -> Result<Option<i64>, Error>
@@ -262,14 +388,12 @@ impl Client {
                 .tx_caches
                 .get(cache.hiqlite_cache_index())
                 .unwrap()
-                .send(CacheRequestHandler::CounterGet((
-                    key.into().to_string(),
-                    ack,
-                )))
+                .send(CacheRequestHandler::CounterGet {
+                    key: key.into().to_string(),
+                    reply: ack,
+                })
                 .expect("kv handler to always be running");
-            let value = rx
-                .await
-                .expect("to always get an answer from the kv handler");
+            let value = await_channel_response(rx).await?;
             Ok(value)
         } else {
             let res = self
@@ -389,7 +513,7 @@ impl Client {
         is_remote_get: bool,
     ) -> Result<CacheResponse, Error> {
         if let Some(state) = self.is_leader_cache_with_state().await {
-            let res = state.raft_cache.raft.client_write(cache_req).await?;
+            let res = Self::client_write_local(&state.raft_cache.raft, cache_req).await?;
             Ok(res.data)
         } else {
             let (ack, rx) = oneshot::channel();
@@ -412,12 +536,10 @@ impl Client {
                 .send_async(payload)
                 .await
                 .map_err(|err| Error::Error(err.to_string().into()))?;
-            let res = rx
-                .await
-                .expect("To always receive an answer from Client Stream Manager")?;
+            let res = await_channel_response(rx).await??;
             match res {
                 ApiStreamResponsePayload::KV(res) => res,
-                #[cfg(any(feature = "sqlite", feature = "dlock", feature = "listen_notify_local"))]
+                #[cfg(any(feature = "sqlite", feature = "dlock", feature = "listen_notify"))]
                 _ => unreachable!(),
             }
         }

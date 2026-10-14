@@ -1,5 +1,5 @@
-use crate::app_state::RaftType;
 use crate::network::handshake::HandshakeSecret;
+use crate::network::tcp_socket::configure_tcp_stream;
 use crate::{Error, NodeId, tls};
 use axum::http::Request;
 use axum::http::header::{CONNECTION, UPGRADE};
@@ -28,13 +28,13 @@ where
 pub async fn try_connect(
     node_id: NodeId,
     addr: &str,
-    raft_type: &RaftType,
+    path: &str,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     secret: &[u8],
 ) -> Result<WebSocket<TokioIo<Upgraded>>, Error> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        try_connect_stream(node_id, addr, raft_type, tls_config, secret),
+        try_connect_stream(node_id, addr, path, tls_config, secret),
     )
     .await
     .map_err(|_| {
@@ -45,7 +45,7 @@ pub async fn try_connect(
 async fn try_connect_stream(
     node_id: NodeId,
     addr: &str,
-    raft_type: &RaftType,
+    path: &str,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     secret: &[u8],
 ) -> Result<WebSocket<TokioIo<Upgraded>>, Error> {
@@ -54,7 +54,7 @@ async fn try_connect_stream(
     } else {
         "http"
     };
-    let uri = format!("{}://{}/stream/{}", scheme, addr, raft_type.as_str());
+    let uri = format!("{}://{}{}", scheme, addr, path);
     info!("Trying to connect to: {uri}");
 
     let req = Request::builder()
@@ -74,9 +74,11 @@ async fn try_connect_stream(
         })?;
 
     debug!("Opening TcpStream to: {addr}");
-    let stream = TcpStream::connect(addr)
+    let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|err| Error::Connect(err.to_string()))?;
+
+    configure_tcp_stream(&mut stream);
 
     let (mut ws, _) = if let Some(config) = tls_config {
         let (addr, _) = addr.split_once(':').unwrap_or((addr, ""));

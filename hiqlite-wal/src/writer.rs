@@ -7,8 +7,8 @@ use crate::wal::WalFileSet;
 use openraft::{LeaderId, LogId};
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::Duration;
+use std::{io, thread};
 use thread_priority::ThreadPriority;
 use tokio::sync::oneshot;
 use tokio::time::Interval;
@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 pub enum Action {
     Append {
         rx: flume::Receiver<Option<(u64, Vec<u8>)>>,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Box<dyn FnOnce(Result<(), io::Error>) + Send>,
         ack: oneshot::Sender<Result<(), Error>>,
     },
     Remove {
@@ -101,7 +101,7 @@ pub fn spawn(
     }
     let wal_locked = Arc::new(RwLock::new(set.clone_no_map()));
 
-    // TODO remove with version <= 0.13
+    // TODO remove with version > 0.14
     // This is a fix for a bug from previous versions. Can be removed in later ones,
     // it would be safe to do probably around version >= 0.13.
     if meta.read()?.last_purged_log_id.is_none()
@@ -140,6 +140,28 @@ pub fn spawn(
     }
 
     Ok((tx, wal_locked))
+}
+
+/// Flush the active WAL file so that everything written to it is on disk.
+///
+/// `flush_async` only starts the writeback and returns, so a WAL flushed that way
+/// is not known to be on disk. Only a flush that returns may clear `is_dirty`.
+fn flush_blocking(
+    wal: &mut WalFileSet,
+    buf: &mut Vec<u8>,
+    is_dirty: &mut bool,
+) -> Result<(), Error> {
+    if !*is_dirty {
+        return Ok(());
+    }
+
+    let active = wal.active();
+    buf.clear();
+    active.update_header(buf)?;
+    active.flush()?;
+    *is_dirty = false;
+
+    Ok(())
 }
 
 fn spawn_syncer(tx_writer: flume::Sender<Action>, mut interval: Interval) {
@@ -189,13 +211,43 @@ fn run(
                 let mut res = Ok(());
                 {
                     let mut active = wal.active();
+
+                    // There is no need to specifically catch a possibly closed channel and respond
+                    // with an error. If that channel is being closed mid-batch append, it means
+                    // openraft (and all other tasks) when down, and it dropped the whole log store.
+                    // If that ever happens, there is no one listening on the other end of your ack
+                    // and callback, which means no one would ever even get our result.
                     while let Ok(Some((id, bytes))) = rx.recv() {
                         if bytes.len() > data_len_limit {
-                            panic!(
-                                "`data` length must not exceed `wal_size` -> data length is {} \
-                            vs wal_size (without header) is {data_len_limit}",
-                                bytes.len(),
-                            );
+                            // A single raft entry cannot span WAL files. By default an
+                            // oversized entry is a non-recoverable setup issue (it needs a
+                            // config change with a full restart, or code changes), so the
+                            // writer panics. With the `oversized-entry-error` feature the
+                            // append instead fails with `Error::WalSizeExceeded` and the
+                            // writer keeps serving subsequent requests. With the default
+                            // `wal_size` of 2MB this is easily reached by a single large
+                            // INSERT, transaction or batch.
+                            #[cfg(feature = "oversized-entry-error")]
+                            {
+                                res = Err(Error::WalSizeExceeded(
+                                    format!(
+                                        "`data` length must not exceed `wal_size` -> data \
+                                        length is {} vs wal_size (without header) is \
+                                        {data_len_limit}",
+                                        bytes.len(),
+                                    )
+                                    .into(),
+                                ));
+                                break;
+                            }
+                            #[cfg(not(feature = "oversized-entry-error"))]
+                            {
+                                panic!(
+                                    "`data` length must not exceed `wal_size` -> data length \
+                                    is {} vs wal_size (without header) is {data_len_limit}",
+                                    bytes.len(),
+                                );
+                            }
                         }
 
                         if !active.has_space(bytes.len() as u32) {
@@ -228,20 +280,51 @@ fn run(
                     lock.active().clone_from_no_mmap(wal.active());
                 }
 
+                let mut res_cb = match &res {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(io::Error::other(err.to_string())),
+                };
+                // We want to ack before flush for throughput. If anything goes wrong during flush,
+                // the openraft callback will get notified about it.
                 if let Err(err) = ack.send(res) {
                     // this should usually not happen, but it may during an incorrect shutdown
                     error!("error sending back ack after logs append: {err:?}");
                 }
 
-                if sync == LogSync::Immediate {
-                    wal.active().flush()?;
-                } else if sync == LogSync::ImmediateAsync {
-                    wal.active().flush_async()?;
-                } else {
-                    is_dirty = true;
+                // The WAL now holds bytes that are not known to be on disk, and only a
+                // blocking flush can clear that state again. `flush_async` merely starts the
+                // writeback, which is why `Action::Remove` and `Action::Vote` below still flush.
+                is_dirty = true;
+                match &sync {
+                    LogSync::Immediate => {
+                        if let Err(err) = flush_blocking(&mut wal, &mut buf, &mut is_dirty) {
+                            // If an immediate flush fails, we want to stop for data consistency.
+                            error!(
+                                "Error during immediate WAL file sync. Stopping Writer to preserve \
+                                data consistency. {err:?}"
+                            );
+                            callback(Err(io::Error::other(err.to_string())));
+                            break;
+                        }
+                    }
+                    LogSync::ImmediateAsync => {
+                        if let Err(err) = wal.active().flush_async() {
+                            res_cb = Err(io::Error::other(err.to_string()));
+                        }
+                    }
+                    LogSync::IntervalMillis(_) => {
+                        // flushes from ticker task
+                    }
                 }
-                // TODO with the next big openraft release, we can do async callbacks
-                callback();
+
+                // openraft takes this callback as "these entries are on disk" and commits on
+                // a quorum of such acks. Only `Immediate` upholds that here: the async levels
+                // deliberately ack first and trade the writeback window for throughput.
+                // TODO check openraft how we should behave in this scenario. I guess, as
+                //  long as we don't callback(), the Raft will fully block. -> verify + double-check
+                //  Do we need to callback() when this batch is processed apart from the result, or
+                //  only ever if it fully succeeded?
+                callback(res_cb);
 
                 // Roll WAL pre-emptively if only very few space is left at this point, because
                 // if we just wrote some chunks, me probably have a very short break now until the
@@ -273,25 +356,28 @@ fn run(
                 // at least headers and metadata are not up to date, and a crash happens in the
                 // middle of removing logs, we could end up with a hole between Snapshot and latest
                 // existing Raft Log, which must never happen.
-                let active = wal.active();
-                if is_dirty {
-                    buf.clear();
-                    active.update_header(&mut buf)?;
-                    // async is fine, as long as we trigger it before starting log removal.
-                    // If the flush fails, so would the log removal, and we would not have a hole.
-                    active.flush_async()?;
-                    is_dirty = false;
+                //
+                // The flush has to block. `flush_async` only starts the writeback and returns,
+                // so a crash during the removal below can still land after the deletions and
+                // before the header reaches disk, which is the hole this guards against.
+                if let Err(err) = flush_blocking(&mut wal, &mut buf, &mut is_dirty) {
+                    ack.send(Err(err)).unwrap();
+                    continue;
+                }
+
+                // Persist the purge frontier before deleting (too low = hole into deleted files;
+                // too high = extra files). Revert it again if the deletion fails below.
+                let previous_purged = meta.read()?.last_purged_log_id.clone();
+                let persist_purged = last_log.is_some();
+                if persist_purged {
+                    meta.write()?.last_purged_log_id = last_log;
+                    Metadata::write(meta.clone(), &wal.base_path)?;
                 }
 
                 buf.clear();
                 buf_logs.clear();
                 match wal.shift_delete_logs(from, until, wal_size, &mut buf, &mut buf_logs) {
                     Ok(_) => {
-                        // the last_log may be none if logs are truncated
-                        if last_log.is_some() {
-                            meta.write()?.last_purged_log_id = last_log;
-                            Metadata::write(meta.clone(), &wal.base_path)?;
-                        }
                         {
                             let mut lock = wal_locked.write().unwrap();
                             lock.active = wal.active;
@@ -299,15 +385,34 @@ fn run(
                         }
                         ack.send(Ok(())).unwrap();
                     }
-                    Err(err) => ack.send(Err(err)).unwrap(),
+                    Err(err) => {
+                        if persist_purged {
+                            // deletion failed: revert the frontier, but still report the error
+                            let revert_res = {
+                                // `Metadata::write` re-locks the meta, so release the guard first
+                                let mut m = meta
+                                    .write()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                m.last_purged_log_id = previous_purged;
+                                drop(m);
+                                Metadata::write(meta.clone(), &wal.base_path)
+                            };
+                            if let Err(revert_err) = revert_res {
+                                error!(
+                                    "Failed to revert last_purged_log_id after log deletion failure: {revert_err}"
+                                );
+                            }
+                        }
+                        ack.send(Err(err)).unwrap();
+                    }
                 }
             }
             Action::Vote { value, ack } => {
                 debug!("WAL Writer - Action::Vote");
 
-                buf.clear();
-                wal.active().flush_async()?;
-                is_dirty = false;
+                // Blocking on purpose: clearing `is_dirty` while an msync is still in flight
+                // would make the interval ticker skip a WAL that never reached disk.
+                flush_blocking(&mut wal, &mut buf, &mut is_dirty)?;
 
                 meta.write()?.vote = Some(value);
                 let res = Metadata::write(meta.clone(), &wal.base_path);
@@ -315,13 +420,9 @@ fn run(
                 ack.send(res).unwrap();
             }
             Action::Sync => {
-                if is_dirty {
-                    let active = wal.active();
-                    buf.clear();
-                    active.update_header(&mut buf)?;
-                    active.flush_async()?;
-                    is_dirty = false;
-                }
+                // The ticker is the only flush in `IntervalMillis` mode and no append waits on
+                // it, so it blocks: `msync(MS_ASYNC)` starts no writeback on Linux at all.
+                flush_blocking(&mut wal, &mut buf, &mut is_dirty)?;
             }
             Action::Shutdown(ack) => {
                 debug!("Raft logs store writer is being shut down");
@@ -349,4 +450,121 @@ fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "oversized-entry-error")]
+    fn append(tx: &flume::Sender<Action>, id: u64, bytes: Vec<u8>) -> Result<(), Error> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (entry_tx, entry_rx) = flume::bounded(1);
+        tx.send(Action::Append {
+            rx: entry_rx,
+            callback: Box::new(|| {}),
+            ack: ack_tx,
+        })
+        .unwrap();
+        entry_tx.send(Some((id, bytes))).unwrap();
+        entry_tx.send(None).unwrap();
+        ack_rx.blocking_recv().unwrap()
+    }
+
+    #[cfg(feature = "oversized-entry-error")]
+    #[test]
+    fn oversized_entry_errors_without_killing_writer() {
+        let base = "test_data/oversized_entry".to_string();
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let lockfile = LockFile::create(&base).unwrap();
+        lockfile.lock().unwrap();
+        let meta = Arc::new(RwLock::new(Metadata::read_or_create(&base).unwrap()));
+
+        let (tx, _wal) = spawn(
+            base.clone(),
+            lockfile,
+            LogSync::Immediate,
+            64 * 1024,
+            false,
+            meta.clone(),
+        )
+        .unwrap();
+
+        // an entry larger than the whole WAL file must error, not panic the writer
+        let res = append(&tx, 1, vec![0u8; 70 * 1024]);
+        assert!(res.is_err(), "oversized entry must error, got {res:?}");
+
+        // the writer must still be alive and accept a normal append afterwards
+        let res = append(&tx, 2, b"ok".to_vec());
+        assert!(res.is_ok(), "writer must survive: {res:?}");
+
+        // graceful shutdown (removes the lockfile)
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(Action::Shutdown(ack_tx)).unwrap();
+        ack_rx.blocking_recv().unwrap();
+    }
+
+    #[cfg(not(feature = "oversized-entry-error"))]
+    #[test]
+    fn oversized_entry_panics_and_kills_writer() {
+        let base = "test_data/oversized_entry_panic".to_string();
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let lockfile = LockFile::create(&base).unwrap();
+        lockfile.lock().unwrap();
+        let meta = Arc::new(RwLock::new(Metadata::read_or_create(&base).unwrap()));
+
+        let (tx, _wal) = spawn(
+            base.clone(),
+            lockfile,
+            LogSync::Immediate,
+            64 * 1024,
+            false,
+            meta.clone(),
+        )
+        .unwrap();
+
+        let send_append = |id: u64, bytes: Vec<u8>| {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let (entry_tx, entry_rx) = flume::bounded(1);
+            // The writer thread may already be dead, so every send can fail and is ignored;
+            // the assertion is that the append is never acked.
+            let _ = tx.send(Action::Append {
+                rx: entry_rx,
+                callback: Box::new(|_| ()),
+                ack: ack_tx,
+            });
+            let _ = entry_tx.send(Some((id, bytes)));
+            let _ = entry_tx.send(None);
+            ack_rx
+        };
+
+        // an oversized entry panics the writer thread by default; the append is never acked
+        let mut ack = send_append(1, vec![0u8; 70 * 1024]);
+        assert!(
+            !recv_with_timeout(&mut ack),
+            "oversized entry must panic the writer (no ack)"
+        );
+
+        // the writer thread is dead: a subsequent append is never acked either
+        let mut ack = send_append(2, b"ok".to_vec());
+        assert!(
+            !recv_with_timeout(&mut ack),
+            "writer must be dead after the panic"
+        );
+    }
+
+    #[cfg(not(feature = "oversized-entry-error"))]
+    fn recv_with_timeout(ack: &mut tokio::sync::oneshot::Receiver<Result<(), Error>>) -> bool {
+        for _ in 0..10 {
+            if ack.try_recv().is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
 }

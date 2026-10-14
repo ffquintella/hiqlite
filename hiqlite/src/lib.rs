@@ -4,6 +4,11 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(doc, feature(doc_cfg))]
 
+// The derive macros emit the absolute path `::hiqlite::...`. That resolves for downstream users,
+// but not from inside this crate. Aliasing self makes the generated code (and in-crate tests of it)
+// resolve the same way.
+extern crate self as hiqlite;
+
 #[cfg(all(feature = "cast_ints", feature = "cast_ints_unchecked"))]
 compile_error!("features `cast_ints` and `cast_ints_unchecked` are mutually exclusive!");
 
@@ -15,15 +20,21 @@ compile_error!("features `cast_ints` and `cast_ints_unchecked` are mutually excl
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 pub use hiqlite_wal::LogSync;
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 pub use openraft::SnapshotPolicy;
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 use std::fmt::{Debug, Display};
 
 #[cfg(feature = "sqlite")]
 use crate::store::state_machine::sqlite::state_machine::Response;
 #[cfg(any(feature = "sqlite", feature = "cache"))]
 pub use crate::{client::Client, error::Error};
+#[cfg(feature = "config-embed")]
+pub use config::REFERENCE_CONFIG;
 #[cfg(any(feature = "sqlite", feature = "cache"))]
 pub use config::{NodeConfig, RaftConfig, RateLimitConfig};
 #[cfg(feature = "sqlite")]
@@ -41,6 +52,20 @@ pub use crate::store::state_machine::sqlite::{
 pub use client::dlock::Lock;
 #[cfg(feature = "sqlite")]
 pub use migration::AppliedMigration;
+
+/// Re-export of the exact `rusqlite` version Hiqlite is built with.
+///
+/// Use this instead of adding a separate `rusqlite` dependency to avoid
+/// version conflicts, e.g. when implementing a `DeterministicSqliteOperation`
+/// against the `rusqlite::Transaction` type.
+#[cfg(any(feature = "sqlite", feature = "external-state-machine"))]
+pub use rusqlite;
+
+/// SQLite state-machine machinery for applications that already own consensus.
+///
+/// This module does not start a Hiqlite Raft group or network service.
+#[cfg(feature = "external-state-machine")]
+pub mod external_state_machine;
 
 #[cfg(any(feature = "sqlite", feature = "cache"))]
 mod app_state;
@@ -67,15 +92,12 @@ mod store;
 mod backup;
 #[cfg(feature = "dashboard")]
 mod dashboard;
+#[cfg(feature = "macros")]
+pub mod macros;
 #[cfg(feature = "sqlite")]
 mod migration;
 #[cfg(feature = "sqlite")]
 mod query;
-#[cfg(any(feature = "sqlite", feature = "cache"))]
-mod split_brain_check;
-
-#[cfg(feature = "macros")]
-pub mod macros;
 
 /// Exports and types to set up a connection to an S3 storage bucket.
 /// Needs the feature `s3` enabled.
@@ -88,22 +110,66 @@ pub mod s3;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 mod http_client;
 #[cfg(any(feature = "sqlite", feature = "cache"))]
 pub mod tls;
 
+#[cfg(feature = "cache")]
+mod v0_15_auto_cache_migration;
+
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 type NodeId = u64;
 
+#[allow(dead_code)]
+pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 pub trait CacheVariants {
     /// Returns the Enum Variants index, strictly matching the output of `hiqlite_cache_variants()`.
     fn hiqlite_cache_index(&self) -> usize;
 
     /// Returns the Enum Variants as `(idx, name)` in strictly ascending order, starting at `0`.
     fn hiqlite_cache_variants() -> &'static [(usize, &'static str)];
+
+    /// Returns the cache variants as a stable, line-oriented text form: one `<index> <name>`
+    /// pair per line in ascending index order (e.g. `0 App\n1 AuthCodes\n`). This is the
+    /// on-disk metadata format written by the cache state machine; parse each line with
+    /// `split_once(' ')`.
+    fn hiqlite_cache_variants_normalized() -> String {
+        Self::hiqlite_cache_variants()
+            .iter()
+            .map(|&(idx, name)| format!("{idx} {name}\n"))
+            .collect()
+    }
+
+    /// Returns `true` when every `(index, name)` pair recorded in `stored` (the normalized
+    /// form of a previously persisted cache index) still exists unchanged in the current enum.
+    /// Adding new variants at the end is allowed (enum expansion); any re-order,
+    /// insert-in-between, removal, or rename makes it incompatible and returns `false`.
+    fn hiqlite_cache_compatible_with(stored: &str) -> bool {
+        let variants = Self::hiqlite_cache_variants();
+        for line in stored.lines() {
+            let (idx, name) = match line.split_once(' ') {
+                Some((idx, name)) => (idx, name),
+                None => return false,
+            };
+            let idx: usize = match idx.parse() {
+                Ok(idx) => idx,
+                Err(_) => return false,
+            };
+            match variants.get(idx).map(|v| v.1) {
+                Some(n) if n == name => {}
+                _ => return false,
+            }
+        }
+        true
+    }
 }
 
 /// A Raft / Hiqlite node
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 pub struct Node {
     /// Each Raft config must include one Node with `id == 1`.
     /// Node `1` will care about init and setup if the Raft does not exit yet or
@@ -118,6 +184,7 @@ pub struct Node {
     pub addr_api: String,
 }
 
+#[cfg(any(feature = "sqlite", feature = "cache"))]
 impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

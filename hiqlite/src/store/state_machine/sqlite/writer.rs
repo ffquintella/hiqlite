@@ -1,4 +1,4 @@
-use crate::helpers::{deserialize, serialize};
+use crate::helpers::{deserialize_serde, serialize_serde};
 use crate::migration::Migration;
 use crate::query::rows::{ColumnOwned, RowOwned, ValueOwned};
 use crate::store::logs;
@@ -21,11 +21,12 @@ use rusqlite::{Batch, CachedStatement, Rows, Transaction};
 use std::borrow::Cow;
 use std::default::Default;
 use std::ops::Sub;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 use thread_priority::ThreadPriority;
 use tokio::sync::oneshot;
-use tokio::{fs, runtime, task};
+use tokio::{fs, runtime, task, time};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -34,7 +35,7 @@ pub enum WriterRequest {
     Query(Query),
     Migrate(Migrate),
     Snapshot(SnapshotRequest),
-    SnapshotApply((String, oneshot::Sender<()>)),
+    SnapshotApply((String, oneshot::Sender<Result<(), Error>>)),
     MetadataRead(oneshot::Sender<StateMachineData>),
     MetadataMembership(MetaMembershipRequest),
     Backup(BackupRequest),
@@ -138,7 +139,8 @@ pub fn spawn_writer(
     path_lock_file: String,
     log_statements: bool,
     do_reset_metadata: bool,
-    #[cfg(feature = "backup")] local_backup_keep_days: u16,
+    #[cfg(feature = "backup")] local_backup_keep_for: Duration,
+    lock_file: std::fs::File,
 ) -> flume::Sender<WriterRequest> {
     let (tx, rx) = flume::bounded::<WriterRequest>(1);
 
@@ -378,7 +380,18 @@ CREATE TABLE IF NOT EXISTS _metadata
                                         let mut first_row: Vec<Value> =
                                             Vec::with_capacity(column_count);
                                         for col_index in 0..column_count {
-                                            first_row.push(row.get(col_index).unwrap());
+                                            match row.get(col_index) {
+                                                Ok(v) => first_row.push(v),
+                                                Err(err) => {
+                                                    query_err = Some(Error::QueryParams(
+                                                        format!(
+                                                            "Cannot read output column {col_index}: {err}"
+                                                        )
+                                                        .into(),
+                                                    ));
+                                                    break 'outer;
+                                                }
+                                            }
                                         }
 
                                         'remaining_rows: loop {
@@ -490,14 +503,15 @@ CREATE TABLE IF NOT EXISTS _metadata
                 WriterRequest::Migrate(req) => {
                     sm_data.last_applied_log_id = req.last_applied_log_id;
 
-                    // TODO should be maybe always panic if migrations throw an error?
-                    let res = migrate(&mut conn, req.migrations);
+                    // `migrate` panics on validation failures (inconsistent DB); only
+                    // DB-level errors, e.g. a busy database, come back as a `Result` error
+                    let res = migrate(&mut conn, req.migrations, req.last_applied_log_id);
 
                     if let Err(err) = conn.execute("PRAGMA optimize", []) {
                         error!("Error during 'PRAGMA optimize': {}", err);
                     }
 
-                    req.tx.send(res).unwrap();
+                    req.tx.send(res).expect("oneshot tx to never be dropped");
                 }
 
                 WriterRequest::Snapshot(SnapshotRequest {
@@ -538,14 +552,19 @@ CREATE TABLE IF NOT EXISTS _metadata
                 WriterRequest::SnapshotApply((path, ack)) => {
                     let start = Instant::now();
                     info!("Starting snapshot restore from {}", path);
-                    conn.restore(
+                    let restore_res = conn.restore(
                         "main",
                         path,
                         Some(|p: Progress| {
                             println!("Database restore remaining: {}", p.remaining);
                         }),
-                    )
-                    .expect("SnapshotApply to always succeed in sql writer");
+                    );
+                    if let Err(err) = restore_res {
+                        error!("Error during snapshot restore: {:?}", err);
+                        ack.send(Err(Error::Sqlite(err.to_string().into())))
+                            .expect("snapshot install listener to always exist");
+                        continue;
+                    }
 
                     if let Err(err) = conn.execute("PRAGMA optimize", []) {
                         error!("Error during 'PRAGMA optimize': {}", err);
@@ -556,16 +575,19 @@ CREATE TABLE IF NOT EXISTS _metadata
                         start.elapsed().as_millis()
                     );
 
+                    // A successful restore must yield readable metadata - otherwise the
+                    // snapshot is corrupt and there is no consistent state to continue from.
                     sm_data = conn
                         .query_row("SELECT data FROM _metadata WHERE key = 'meta'", (), |row| {
                             let meta_bytes: Vec<u8> = row.get(0)?;
                             let metadata: StateMachineData =
-                                deserialize(&meta_bytes).expect("Metadata to deserialize ok");
+                                deserialize_serde(&meta_bytes).expect("Metadata to deserialize ok");
                             Ok(metadata)
                         })
                         .expect("Metadata query to always succeed");
 
-                    ack.send(()).unwrap()
+                    ack.send(Ok(()))
+                        .expect("snapshot install listener to always exist");
                 }
 
                 WriterRequest::MetadataRead(ack) => {
@@ -578,8 +600,11 @@ CREATE TABLE IF NOT EXISTS _metadata
                             let bytes: Vec<u8> = row.get(0)?;
                             Ok(bytes)
                         }) {
+                            // a present but corrupt metadata row leaves no known log
+                            // position - fail hard rather than guess
                             Ok(bytes) => {
-                                sm_data = deserialize(&bytes).unwrap();
+                                sm_data =
+                                    deserialize_serde(&bytes).expect("Metadata to deserialize ok");
                             }
                             Err(err) => {
                                 warn!("No metadata exists inside the DB yet");
@@ -587,13 +612,16 @@ CREATE TABLE IF NOT EXISTS _metadata
                         }
                     }
 
-                    ack.send(sm_data.clone()).unwrap();
+                    ack.send(sm_data.clone())
+                        .expect("metadata read listener to always exist");
                 }
 
                 WriterRequest::MetadataMembership(req) => {
                     sm_data.last_membership = req.last_membership;
                     sm_data.last_applied_log_id = req.last_applied_log_id;
-                    req.ack.send(()).unwrap();
+                    req.ack
+                        .send(())
+                        .expect("membership ack listener to always exist");
                 }
 
                 WriterRequest::Backup(req) => {
@@ -648,7 +676,7 @@ CREATE TABLE IF NOT EXISTS _metadata
                     rt.spawn(async move {
                         if let Err(err) = crate::backup::backup_local_cleanup(
                             req.target_folder,
-                            local_backup_keep_days,
+                            local_backup_keep_for,
                         )
                         .await
                         {
@@ -666,7 +694,7 @@ CREATE TABLE IF NOT EXISTS _metadata
 
                 WriterRequest::RTT(req) => {
                     sm_data.last_applied_log_id = req.last_applied_log_id;
-                    req.ack.send(()).unwrap();
+                    req.ack.send(()).expect("rtt ack listener to always exist");
                 }
 
                 WriterRequest::Shutdown(ack) => {
@@ -685,6 +713,8 @@ CREATE TABLE IF NOT EXISTS _metadata
             error!("Error during 'PRAGMA optimize': {}", err);
         }
 
+        // release the advisory lock, then remove the crash-marker file
+        drop(lock_file);
         StateMachineSqlite::remove_lock_file(&path_lock_file);
 
         if let Some(ack) = shutdown_ack {
@@ -701,7 +731,7 @@ fn persist_metadata(
     conn: &rusqlite::Connection,
     metadata: &StateMachineData,
 ) -> Result<(), rusqlite::Error> {
-    let meta_bytes = serialize(metadata).unwrap();
+    let meta_bytes = serialize_serde(metadata).unwrap();
     let mut stmt = conn.prepare("REPLACE INTO _metadata (key, data) VALUES ('meta', $1)")?;
     stmt.execute([meta_bytes])?;
     Ok(())
@@ -738,11 +768,36 @@ Got:      {}
 }
 
 #[inline]
-fn create_snapshot(conn: &rusqlite::Connection, path: String) -> Result<(), rusqlite::Error> {
-    let q = format!("VACUUM main INTO '{path}'");
-    conn.execute(&q, ())?;
+fn create_snapshot<P: Into<PathBuf>>(conn: &rusqlite::Connection, path: P) -> Result<(), Error> {
+    let mut path = path.into();
+    // vacuum into a temp file and move it into place, so a crash can never leave a
+    // partially written snapshot at the final path
+    let mut path_temp = path.clone();
+    path_temp.add_extension("tmp");
+    // escape single quotes so a folder name containing ' cannot break (or inject into) the SQL literal
+    let q = format!(
+        "VACUUM main INTO '{}'",
+        path_temp
+            .as_os_str()
+            .to_str()
+            .unwrap_or_default()
+            .replace('\'', "''")
+    );
+    if let Err(err) = conn.execute(&q, ()) {
+        let _ = std::fs::remove_file(&path_temp);
+        return Err(Error::Sqlite(err.to_string().into()));
+    }
+    std::fs::File::open(&path_temp)?.sync_data();
+    std::fs::rename(&path_temp, &path)
+        .map_err(|err| Error::Error(format!("rename snapshot into place: {err}").into()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_data();
+    }
     Ok(())
 }
+
+#[cfg(feature = "s3")]
+const S3_MAX_RETRIES: u64 = 10;
 
 fn create_backup(
     conn: &rusqlite::Connection,
@@ -761,7 +816,21 @@ fn create_backup(
     let path_full = format!("{target_folder}/{file}");
     info!("Creating database backup into {path_full}");
 
-    conn.execute(&format!("VACUUM main INTO '{path_full}'"), ())?;
+    // vacuum into a temp file and move it into place, so a crash mid-backup can never leave
+    // a partial file under the final backup name (restore would pick it up as valid)
+    let path_temp = format!("{path_full}~");
+    // escape single quotes so a folder name containing ' cannot break (or inject into) the SQL literal
+    let path_sql = path_temp.replace('\'', "''");
+    if let Err(err) = conn.execute(&format!("VACUUM main INTO '{path_sql}'"), ()) {
+        let _ = std::fs::remove_file(&path_temp);
+        return Err(err.into());
+    }
+    if let Err(err) = std::fs::rename(&path_temp, &path_full) {
+        let _ = std::fs::remove_file(&path_temp);
+        return Err(Error::Error(
+            format!("rename backup into place: {err}").into(),
+        ));
+    }
 
     // connect to the backup and reset metadata
     // make sure connection is dropped before starting encrypt + push
@@ -777,12 +846,28 @@ fn create_backup(
         rt.spawn(async move {
             info!("Background task for database encryption and S3 backup task has been started");
 
-            match s3.push(&path_full, &file).await {
-                Ok(_) => {
-                    info!("Push backup to S3 has been finished");
-                }
-                Err(err) => {
-                    error!("Error pushing Backup to S3: {}", err);
+            // The backup was already acked; retry the upload so a failure is not just a log line.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match s3.push(&path_full, &file).await {
+                    Ok(_) => {
+                        info!("Push backup to S3 has been finished");
+                        break;
+                    }
+                    Err(err) if attempt < S3_MAX_RETRIES => {
+                        error!(
+                            "Error pushing Backup to S3 (attempt {attempt}/{S3_MAX_RETRIES}): {err} - retrying"
+                        );
+                        time::sleep(Duration::from_secs(5 * attempt)).await;
+                    }
+                    Err(err) => {
+                        error!(
+                            "Error pushing Backup to S3 after {attempt} attempts: {err} - \
+                            the backup exists locally but not offsite"
+                        );
+                        break;
+                    }
                 }
             }
         });
@@ -791,7 +876,15 @@ fn create_backup(
     Ok(())
 }
 
-fn migrate(conn: &mut rusqlite::Connection, mut migrations: Vec<Migration>) -> Result<(), Error> {
+fn migrate(
+    conn: &mut rusqlite::Connection,
+    mut migrations: Vec<Migration>,
+    last_applied_log_id: Option<LogId<NodeId>>,
+) -> Result<(), Error> {
+    // The migration `ts` must be identical on all nodes: the wall clock would diverge, the
+    // raft log id is deterministic.
+    let migration_ts = last_applied_log_id.map(|l| l.index as i64).unwrap_or(0);
+
     info!("Applying database migrations");
 
     create_migrations_table(conn)?;
@@ -806,6 +899,7 @@ fn migrate(conn: &mut rusqlite::Connection, mut migrations: Vec<Migration>) -> R
 
     for migration in migrations {
         if migration.id != last_applied + 1 {
+            // Migrations are compile-time; a gap in the applied ids means a broken deployment.
             panic!(
                 "Migration index has a gap between {} and {}",
                 last_applied, migration.id
@@ -814,7 +908,7 @@ fn migrate(conn: &mut rusqlite::Connection, mut migrations: Vec<Migration>) -> R
         last_applied = migration.id;
 
         let txn = conn.transaction()?;
-        apply_migration(txn, migration)?;
+        apply_migration(txn, migration, migration_ts)?;
     }
 
     Ok(())
@@ -889,6 +983,8 @@ fn last_applied_migration(
     let mut last_applied = first_id - 1;
     for applied in already_applied {
         if last_applied + 1 != applied.id {
+            // Applied migrations must match the embedded ones exactly - anything else
+            // means an inconsistent DB that must not keep running.
             panic!(
                 "Applied migrations order mismatch: expected {}, got {}",
                 last_applied + 1,
@@ -928,7 +1024,11 @@ fn last_applied_migration(
 }
 
 #[inline]
-fn apply_migration(txn: rusqlite::Transaction, migration: Migration) -> Result<(), Error> {
+fn apply_migration(
+    txn: rusqlite::Transaction,
+    migration: Migration,
+    migration_ts: i64,
+) -> Result<(), Error> {
     info!(
         "Applying database migration {} {}",
         migration.id, migration.name
@@ -948,14 +1048,69 @@ fn apply_migration(txn: rusqlite::Transaction, migration: Migration) -> Result<(
         VALUES ($1, $2, $3, $4)
         "#,
         )?;
-        stmt.execute((
-            migration.id,
-            migration.name,
-            Utc::now().timestamp(),
-            migration.hash,
-        ))?;
+        stmt.execute((migration.id, migration.name, migration_ts, migration.hash))?;
     }
 
     txn.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_ts_is_deterministic() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_migrations_table(&conn).unwrap();
+
+        let migration = Migration {
+            id: 1,
+            name: "test".to_string(),
+            hash: "abc123".to_string(),
+            content: b"CREATE TABLE test (id INTEGER NOT NULL PRIMARY KEY);".to_vec(),
+        };
+
+        let txn = conn.transaction().unwrap();
+        apply_migration(txn, migration, 42).unwrap();
+
+        // ts must equal the raft log id, not the wall clock
+        let (id, ts): (u32, i64) = conn
+            .query_row("SELECT id, ts FROM _migrations WHERE id = 1", (), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(ts, 42);
+    }
+
+    #[test]
+    fn migration_validation_gap_panics() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_migrations_table(&conn).unwrap();
+        // mark migration 2 as applied, skipping 1 -> a gap means an inconsistent DB,
+        // so this must panic, not return an error
+        conn.execute(
+            "INSERT INTO _migrations (id, name, ts, hash) VALUES (2, 'two', 0, 'h')",
+            (),
+        )
+        .unwrap();
+
+        let migrations = vec![Migration {
+            id: 1,
+            name: "one".to_string(),
+            hash: "h1".to_string(),
+            content: b"".to_vec(),
+        }];
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = last_applied_migration(&conn, &migrations);
+        }))
+        .unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(msg.contains("order mismatch"));
+    }
 }

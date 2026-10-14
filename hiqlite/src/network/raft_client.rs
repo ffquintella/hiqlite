@@ -1,7 +1,7 @@
 use crate::Node;
 use crate::NodeId;
 use crate::app_state::RaftType;
-use crate::helpers::{deserialize, serialize};
+use crate::helpers::{deserialize_serde, serialize_serde};
 use crate::network::raft_server::{
     RaftStreamRequest, RaftStreamResponse, RaftStreamResponsePayload,
 };
@@ -169,21 +169,25 @@ enum WritePayload {
     Close,
 }
 
-/// Aborts the wrapped task when dropped.
+/// A [`JoinHandle`] that aborts its task when dropped.
 ///
-/// Tokio `JoinHandle`s only *detach* their task on drop, they do not abort it.
-/// `ws_handler` spawns the `stream_reader` / `stream_writer` tasks and holds
-/// their handles across the inner loop's `.await` points. When the owning
-/// `NetworkConnectionStreaming` is dropped (openraft rebuilds the client for a
-/// target) its `Drop` calls `task.abort()` on the parent `ws_handler` task.
-/// Aborting the parent drops these handles, which — being plain `JoinHandle`s —
-/// would *detach* the reader/writer instead of stopping them. The detached
-/// tasks keep the upgraded WebSocket's split socket halves alive, so the TCP
-/// connection is never closed and leaks as an `ESTABLISHED` socket on both
-/// peers. Under replication churn this exhausts the ephemeral port range and
-/// breaks Raft quorum. Binding the abort to scope guarantees teardown on every
-/// drop path (clean break, parent abort, or panic).
+/// `ws_handler` owns the handles of the reader and writer tasks that hold the
+/// two halves of the WebSocket, and aborts them on its own reconnect path. That
+/// path never runs when `ws_handler` is itself aborted, and dropping a bare
+/// `JoinHandle` only detaches its task instead of cancelling it, so the two
+/// tasks would keep the socket open for good. Wrapping the handles propagates
+/// the cancellation: aborting `ws_handler` drops its locals, and dropping this
+/// guard aborts the task it holds.
 struct AbortOnDrop(JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// Abort eagerly. Idempotent, so the explicit aborts on the reconnect path
+    /// and the later `Drop` do not conflict.
+    #[inline]
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -232,7 +236,7 @@ impl NetworkStreaming {
                 match web_socket_connect::try_connect(
                     this_node,
                     &node.addr_raft,
-                    &raft_type,
+                    &format!("/stream/{}", raft_type.as_str()),
                     tls_config.clone(),
                     &secret,
                 )
@@ -296,11 +300,12 @@ impl NetworkStreaming {
             // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
             let read = FragmentCollectorRead::new(read);
 
-            // Wrapped in `AbortOnDrop` so that aborting/dropping `ws_handler`
-            // tears these down too (see `AbortOnDrop` docs) instead of leaking
-            // the socket.
-            let handle_read =
-                AbortOnDrop(task::spawn(Box::pin(Self::stream_reader(read, tx_read.clone()))));
+            // Guarded: `ws_handler` may be aborted before it reaches the
+            // aborts below, and these must then cancel and not detach.
+            let handle_read = AbortOnDrop(task::spawn(Box::pin(Self::stream_reader(
+                read,
+                tx_read.clone(),
+            ))));
             let handle_write =
                 AbortOnDrop(task::spawn(Box::pin(Self::stream_writer(write, rx_write))));
 
@@ -382,7 +387,7 @@ impl NetworkStreaming {
                 };
 
                 if let Some((ack, payload)) = stream_req {
-                    let bytes = serialize(&payload).unwrap();
+                    let bytes = serialize_serde(&payload).unwrap();
 
                     if let Err(err) = tx_write.send_async(WritePayload::Payload(bytes)).await {
                         let _ = ack.send(Err(Error::Connect(format!(
@@ -408,11 +413,8 @@ impl NetworkStreaming {
             // Since we need to re-connect, there is no need to rush anyway.
             time::sleep(Duration::from_millis(250)).await;
 
-            // Dropping the guards aborts the reader/writer tasks, which drops
-            // the split socket halves and closes the TCP connection before we
-            // reconnect (or exit).
-            drop(handle_write);
-            drop(handle_read);
+            handle_write.abort();
+            handle_read.abort();
 
             if shutdown {
                 break;
@@ -443,7 +445,15 @@ impl NetworkStreaming {
                 OpCode::Text => {}
                 OpCode::Binary => {
                     let bytes = frame.payload.deref();
-                    let payload = deserialize::<RaftStreamResponse>(bytes).unwrap();
+                    let payload = match deserialize_serde::<RaftStreamResponse>(bytes) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            // corrupt frame from a cluster member: drop the connection instead
+                            // of panicking the raft client task
+                            error!("Error deserializing raft response from member: {err:?}");
+                            break;
+                        }
+                    };
                     if let Err(err) = tx.send_async(RaftRequest::StreamResponse(payload)).await {
                         error!(
                             "Error sending Response to Raft client stream manager: {:?}",
@@ -503,6 +513,8 @@ impl Drop for NetworkConnectionStreaming {
 }
 
 impl NetworkConnectionStreaming {
+    // The error type is huge, but defined by the openraft trait.
+    #[allow(clippy::result_large_err)]
     #[inline(always)]
     async fn send<Err>(
         &mut self,

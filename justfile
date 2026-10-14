@@ -4,6 +4,9 @@ export TAG := `cat hiqlite/Cargo.toml | grep '^version =' | cut -d " " -f3 | xar
 export MSRV := `cat hiqlite/Cargo.toml | grep '^rust-version =' | cut -d " " -f3 | xargs`
 export USER := `echo "$(id -u):$(id -g)"`
 
+# Allows overwriting a dependency version if we pin it specifically.
+export CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE := 'allow'
+
 [private]
 default:
     @just -l
@@ -66,8 +69,10 @@ check:
     set -euxo pipefail
     clear
     cargo update
+    cargo fmt --check
     cargo clippy -- -D warnings
     cargo minimal-versions check -p hiqlite --features server
+    cargo minimal-versions check -p hiqlite --no-default-features --features external-state-machine
     cargo minimal-versions check -p hiqlite-wal
 
     # update at the end again for following clippy and testing
@@ -95,12 +100,20 @@ clippy:
     cargo clippy --no-default-features --features in-memory-snapshots -- -D warnings
     cargo clippy --no-default-features --features counters -- -D warnings
     cargo clippy --no-default-features --features dlock -- -D warnings
-    cargo clippy --no-default-features --features listen_notify_local -- -D warnings
     cargo clippy --no-default-features --features listen_notify -- -D warnings
-    cargo clippy --no-default-features --features sqlite,cache -- -D warnings
+    cargo clippy --no-default-features --features sqlite,cache,webpki-roots -- -D warnings
 
     cargo clippy --no-default-features --features dashboard -- -D warnings
     cargo clippy --no-default-features --features shutdown-handle -- -D warnings
+
+    # external-state-machine must build standalone without pulling in the
+    # internal `__cluster` boundary, and must not break any regular combination
+    cargo clippy --no-default-features --features external-state-machine -- -D warnings
+    cargo clippy --no-default-features --features sqlite,external-state-machine -- -D warnings
+    cargo clippy --no-default-features --features full,external-state-machine -- -D warnings
+    cargo clippy --features external-state-machine -- -D warnings
+
+    cargo clippy --no-default-features --features server -- -D warnings
 
 clippy-examples:
     #!/usr/bin/env bash
@@ -124,14 +137,14 @@ test test="":
     #!/usr/bin/env bash
     set -euxo pipefail
     clear
-    cargo test --features cache,counters,dlock,listen_notify,macros,toml {{ test }}
+    cargo test --features full,counters,external-state-machine,server {{ test }}
 
 # runs the full set of tests excluding backup to S3 tests
 test-no-s3:
     #!/usr/bin/env bash
     set -euxo pipefail
     clear
-    TEST_SKIP_S3_RESTORE="true" cargo test --features cache,counters,dlock,listen_notify,macros,toml
+    TEST_SKIP_S3_RESTORE="true" cargo test --features cache,counters,dlock,listen_notify,macros,toml,external-state-machine
 
 # builds the code
 build ty="server":

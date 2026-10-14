@@ -1,6 +1,5 @@
 use crate::{LogStore, LogStoreReader, reader, writer};
-use bincode::config::{Configuration, Fixint, LittleEndian};
-use bincode::error::{DecodeError, EncodeError};
+use bincode_next::error::{DecodeError, EncodeError};
 use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{
     AnyError, ErrorSubject, ErrorVerb, LogId, OptionalSend, RaftLogId, RaftLogReader,
@@ -14,18 +13,15 @@ use std::ops::RangeBounds;
 use tokio::sync::oneshot;
 use tracing::debug;
 
-const BINCODE_CONFIG: Configuration<LittleEndian, Fixint> = bincode::config::legacy();
-
 #[inline(always)]
 pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, EncodeError> {
-    // We are using the legacy config on purpose here. It uses fixed-width integer fields, which
-    // uses a bit more space, but is faster.
-    bincode::serde::encode_to_vec(value, BINCODE_CONFIG)
+    bincode_next::serde::encode_to_vec(value, bincode_next::config::legacy())
 }
 
 #[inline(always)]
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
-    bincode::serde::decode_from_slice::<T, _>(bytes, BINCODE_CONFIG).map(|(res, _)| res)
+    bincode_next::serde::decode_from_slice::<T, _>(bytes, bincode_next::config::legacy())
+        .map(|(res, _)| res)
 }
 
 impl<T> RaftLogReader<T> for LogStore<T>
@@ -54,6 +50,8 @@ where
 
 #[tracing::instrument(skip_all)]
 #[inline(always)]
+// The error type is huge, but it's given by the openraft trait definition.
+#[allow(clippy::result_large_err)]
 async fn try_get_log_entries<
     T: RaftTypeConfig,
     RB: RangeBounds<u64> + Clone + Debug + OptionalSend,
@@ -63,17 +61,23 @@ async fn try_get_log_entries<
 ) -> Result<Vec<T::Entry>, StorageError<T::NodeId>> {
     let from = match range.start_bound() {
         Bound::Included(i) => *i,
-        Bound::Excluded(i) => *i + 1,
+        // `Excluded(u64::MAX)` means "nothing after this" - treat it as an empty range below
+        Bound::Excluded(i) => i.checked_add(1).unwrap_or(u64::MAX),
         Bound::Unbounded => 0,
     };
     let until = match range.end_bound() {
         Bound::Included(i) => *i,
-        Bound::Excluded(i) => *i - 1,
+        // `Excluded(0)` means "up to but not including log 0" - an empty range
+        Bound::Excluded(i) => i.saturating_sub(1),
         Bound::Unbounded => unreachable!(),
     };
     debug!("Entering try_get_log_entries() from {from} until {until}");
 
-    let mut res: Vec<T::Entry> = Vec::with_capacity((until - from) as usize + 1);
+    if from > until {
+        // empty range - nothing to read (also covers `Excluded(u64::MAX)` / `Excluded(0)`)
+        return Ok(Vec::new());
+    }
+    let mut res: Vec<T::Entry> = Vec::with_capacity((until - from + 1) as usize);
 
     let (ack, rx) = flume::bounded(1);
     tx.send_async(reader::Action::Logs { from, until, ack })
@@ -203,7 +207,7 @@ where
         let (tx, rx) = flume::bounded(1);
         let (ack, ack_rx) = oneshot::channel();
 
-        let callback = Box::new(move || callback.log_io_completed(Ok(())));
+        let callback = Box::new(move |res| callback.log_io_completed(res));
         self.writer
             .send_async(writer::Action::Append { rx, callback, ack })
             .await

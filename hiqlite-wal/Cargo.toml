@@ -1,10 +1,10 @@
 [package]
 name = "hiqlite-wal"
-version = "0.14.0"
+version = "0.15.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-rust-version = "1.88"
+rust-version = "1.95"
 categories = ["database", "caching"]
 keywords = ["database", "raft", "cache", "wal"]
 description = "WAL file implementation for Hiqlite"
@@ -13,6 +13,9 @@ repository = "https://github.com/sebadob/hiqlite"
 [features]
 auto-heal = []
 migration = []
+# Oversized raft entries panic the writer by default (a non-recoverable setup issue).
+# Enable this to fail the append with `Error::WalSizeExceeded` and keep the writer alive.
+oversized-entry-error = []
 
 [lib]
 doctest = false
@@ -21,7 +24,7 @@ doctest = false
 all-features = true
 
 [dependencies]
-bincode.workspace = true
+bincode-next.workspace = true
 byteorder.workspace = true
 crc.workspace = true
 flume.workspace = true
@@ -33,3 +36,9 @@ thiserror.workspace = true
 thread-priority.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true

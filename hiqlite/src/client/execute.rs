@@ -1,3 +1,4 @@
+use crate::client::helpers::await_channel_response;
 use crate::client::stream::{ClientExecutePayload, ClientStreamReq};
 use crate::network::api::ApiStreamResponsePayload;
 use crate::query::rows::RowOwned;
@@ -47,11 +48,8 @@ impl Client {
     #[inline(always)]
     async fn execute_req(&self, sql: Query) -> Result<usize, Error> {
         if let Some(state) = self.is_leader_db_with_state().await {
-            let res = state
-                .raft_db
-                .raft
-                .client_write(QueryWrite::Execute(sql))
-                .await?;
+            let res =
+                Self::client_write_local(&state.raft_db.raft, QueryWrite::Execute(sql)).await?;
             let resp: Response = res.data;
             match resp {
                 Response::Execute(res) => res.result,
@@ -68,9 +66,7 @@ impl Client {
                 }))
                 .await
                 .map_err(|err| Error::Error(err.to_string().into()))?;
-            let res = rx
-                .await
-                .expect("To always receive an answer from Client Stream Manager")?;
+            let res = await_channel_response(rx).await??;
             match res {
                 ApiStreamResponsePayload::Execute(res) => res,
                 _ => unreachable!(),
@@ -216,9 +212,7 @@ impl Client {
                 }))
                 .await
                 .map_err(|err| Error::Error(err.to_string().into()))?;
-            let res = rx
-                .await
-                .expect("To always receive an answer from Client Stream Manager")?;
+            let res = await_channel_response(rx).await??;
             match res {
                 ApiStreamResponsePayload::ExecuteReturning(res) => res,
                 _ => unreachable!(),

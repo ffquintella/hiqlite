@@ -1,19 +1,22 @@
 use crate::app_state::AppState;
 use crate::network::raft_server;
+use crate::network::tcp_socket::{
+    ConfiguredStreamAcceptor, configure_tcp_stream, create_listening_socket,
+};
 use crate::network::{api, management};
-use crate::{CacheVariants, Client, Error, NodeConfig, init, split_brain_check, store};
+use crate::{CacheVariants, Client, Error, NodeConfig, init, store};
 use axum::Router;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use chrono::Utc;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 #[cfg(feature = "backup")]
 use crate::backup;
@@ -35,12 +38,21 @@ where
     }
 
     let tls_api_client_config = node_config.tls_api.clone().map(|c| c.client_config());
+    let tls_api = node_config.tls_api.is_some();
     let tls_raft = node_config.tls_raft.is_some();
-    let tls_no_verify = node_config
-        .tls_raft
+    let tls_no_verify_api = node_config
+        .tls_api
         .as_ref()
         .map(|c| c.danger_tls_no_verify())
         .unwrap_or(false);
+
+    #[cfg(feature = "cache")]
+    if let Err(err) = crate::v0_15_auto_cache_migration::check_migrate(&node_config).await {
+        error!(
+            "Error during auto-migration for the Cache WAL layer and version migration: {err:?}"
+        );
+        return Err(err);
+    }
 
     #[cfg(any(feature = "s3", feature = "dashboard"))]
     node_config.init_enc_keys();
@@ -51,7 +63,13 @@ where
     #[cfg(all(feature = "backup", feature = "sqlite"))]
     let backup_applied = backup::restore_backup_start(&node_config).await?;
 
-    let raft_config = Arc::new(node_config.raft_config.clone().validate().unwrap());
+    let raft_config = Arc::new(
+        node_config
+            .raft_config
+            .clone()
+            .validate()
+            .map_err(|err| Error::Config(format!("Invalid Raft config: {err}").into()))?,
+    );
 
     let _do_reset_metadata = init::check_execute_reset(&node_config.data_dir).await?;
     #[cfg(feature = "sqlite")]
@@ -64,8 +82,18 @@ where
     let (api_addr, rpc_addr) = {
         let node = node_config
             .nodes
-            .get(node_config.node_id as usize - 1)
-            .expect("NodeConfig.node_id not found in NodeConfig.nodes");
+            .iter()
+            .find(|node| node.id == node_config.node_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(
+                    format!(
+                        "NodeConfig.node_id {} not found in NodeConfig.nodes",
+                        node_config.node_id
+                    )
+                    .into(),
+                )
+            })?;
 
         let api_addr = build_listen_addr(
             &node_config.listen_addr_api,
@@ -76,6 +104,15 @@ where
 
         (api_addr, addr_raft)
     };
+
+    // Fail loudly if a listen address is not a valid `host:port` - e.g. because
+    // `HQL_LISTEN_ADDR_API/RAFT` already contained a port, which would be appended twice here.
+    let api_socket_addr = SocketAddr::from_str(&api_addr).map_err(|err| {
+        Error::Config(format!("Invalid API listen address '{api_addr}': {err}").into())
+    })?;
+    let rpc_socket_addr = SocketAddr::from_str(&rpc_addr).map_err(|err| {
+        Error::Config(format!("Invalid Raft listen address '{rpc_addr}': {err}").into())
+    })?;
 
     #[cfg(feature = "sqlite")]
     let (tx_client_stream, rx_client_stream) = flume::bounded(1);
@@ -104,18 +141,11 @@ where
         client_request_id: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(any(feature = "backup", feature = "dashboard"))]
         tx_client_stream: tx_client_stream.clone(),
-        health_check_delay_secs: node_config.health_check_delay_secs,
+        health_check_delay: node_config.health_check_delay,
         learner_only: node_config.learner_only,
         #[cfg(feature = "s3")]
         s3_config: node_config.s3_config.clone(),
     });
-
-    #[cfg(any(feature = "sqlite", feature = "cache"))]
-    split_brain_check::spawn(
-        state.clone(),
-        node_config.nodes.clone(),
-        node_config.tls_api.is_some(),
-    );
 
     #[cfg(all(feature = "backup", feature = "sqlite"))]
     if backup_applied {
@@ -130,6 +160,7 @@ where
         .route("/stream/cache", get(raft_server::stream_cache))
         .route("/health", get(api::health))
         .route("/ping", get(api::ping))
+        .route("/version", get(api::get_version))
         // .layer(compression_middleware.clone().into_inner())
         .with_state(state.clone());
 
@@ -137,25 +168,55 @@ where
 
     let shutdown = shutdown_signal(rx_shutdown.clone());
     if let Some(config) = &node_config.tls_raft {
+        let listener = create_listening_socket(rpc_socket_addr)
+            .await
+            .map_err(|err| {
+                Error::Config(
+                    format!("Cannot bind Raft listen address '{rpc_addr}': {err:?}").into(),
+                )
+            })?;
+        let std_listener = listener
+            .into_std()
+            .expect("Converting a fresh, idle TCP listener to std should not fail");
+
         let config = config.server_config(&node_config.listen_addr_raft).await;
+        let handle = axum_server::Handle::<std::net::SocketAddr>::new();
+        let h_shutdown = handle.clone();
         task::spawn(Box::pin(async move {
-            let addr = SocketAddr::from_str(&rpc_addr).expect("valid RPC socket address");
-            // TODO find a way to do a graceful shutdown with `axum_server` or to handle TLS
-            //  properly with axum directly
-            axum_server::bind_rustls(addr, config)
+            let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
+                .acceptor(ConfiguredStreamAcceptor);
+            axum_server::from_tcp(std_listener)
+                // errors when the socket is blocking
+                .expect("properly configured TCP listener")
+                .acceptor(acceptor)
+                .handle(handle)
                 .serve(router_internal.into_make_service())
                 .await
-                .unwrap();
+                .map_err(|err| error!("Raft server stopped: {err}"))
         }));
+        let rx = rx_shutdown.clone();
+        task::spawn(async move {
+            shutdown_signal(rx).await;
+            h_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+        });
     } else {
+        // Bind before spawning so that a bind failure fails startup loudly instead of
+        // panicking inside the spawned task with a dropped JoinError.
+        let listener = create_listening_socket(rpc_socket_addr)
+            .await
+            .map_err(|err| {
+                Error::Config(
+                    format!("Cannot bind Raft listen address '{rpc_addr}': {err:?}").into(),
+                )
+            })?;
         task::spawn(Box::pin(async move {
-            let listener = TcpListener::bind(rpc_addr)
-                .await
-                .expect("valid RPC socket address");
-            axum::serve(listener, router_internal.into_make_service())
-                .with_graceful_shutdown(shutdown)
-                .await
-                .unwrap()
+            axum::serve(
+                listener.tap_io(configure_tcp_stream),
+                router_internal.into_make_service(),
+            )
+            .with_graceful_shutdown(shutdown)
+            .await
+            .map_err(|err| error!("Raft server stopped: {err}"))
         }));
     };
 
@@ -182,7 +243,8 @@ where
         .route("/backup", post(api::post_create_backup))
         .route("/health", get(api::health))
         .route("/ready", get(api::ready))
-        .route("/ping", get(api::ping));
+        .route("/ping", get(api::ping))
+        .route("/version", get(api::get_version));
 
     #[cfg(not(feature = "dashboard"))]
     let router_api = default_routes.with_state(state.clone());
@@ -219,27 +281,59 @@ where
         default_routes.with_state(state.clone())
     };
 
+    #[cfg(feature = "dashboard")]
+    dashboard::set_api_tls(node_config.tls_api.is_some());
+
     info!("api external listening on {api_addr}");
     if let Some(config) = &node_config.tls_api {
+        let listener = create_listening_socket(api_socket_addr)
+            .await
+            .map_err(|err| {
+                Error::Config(
+                    format!("Cannot bind API listen address '{api_addr}': {err:?}").into(),
+                )
+            })?;
+        let std_listener = listener
+            .into_std()
+            .expect("Converting a fresh, idle TCP listener to std should not fail");
+
         let config = config.server_config(&node_config.listen_addr_api).await;
+        let handle = axum_server::Handle::<std::net::SocketAddr>::new();
+        let h_shutdown = handle.clone();
         task::spawn(Box::pin(async move {
-            let addr = SocketAddr::from_str(&api_addr).expect("valid RPC socket address");
-            // TODO find a way to do a graceful shutdown with `axum_server` or to handle TLS
-            //  properly with axum directly
-            axum_server::bind_rustls(addr, config)
+            let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
+                .acceptor(ConfiguredStreamAcceptor);
+            axum_server::from_tcp(std_listener)
+                // errors when the socket is blocking
+                .expect("properly configured TCP listener")
+                .acceptor(acceptor)
+                .handle(handle)
                 .serve(router_api.into_make_service())
                 .await
-                .unwrap();
+                .map_err(|err| error!("API server stopped: {err}"))
         }));
+        let rx = rx_shutdown.clone();
+        task::spawn(async move {
+            shutdown_signal(rx).await;
+            h_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+        });
     } else {
+        let listener = create_listening_socket(api_socket_addr)
+            .await
+            .map_err(|err| {
+                Error::Config(
+                    format!("Cannot bind API listen address '{api_addr}': {err:?}").into(),
+                )
+            })?;
+
         task::spawn(Box::pin(async move {
-            let listener = TcpListener::bind(api_addr)
-                .await
-                .expect("valid RPC socket address");
-            axum::serve(listener, router_api.into_make_service())
-                .with_graceful_shutdown(shutdown_signal(rx_shutdown))
-                .await
-                .unwrap()
+            axum::serve(
+                listener.tap_io(configure_tcp_stream),
+                router_api.into_make_service(),
+            )
+            .with_graceful_shutdown(shutdown_signal(rx_shutdown))
+            .await
+            .map_err(|err| error!("API server stopped: {err}"))
         }));
     };
 
@@ -255,8 +349,8 @@ where
                 &crate::app_state::RaftType::Sqlite,
                 node_id,
                 &nodes,
-                tls_raft,
-                tls_no_verify,
+                tls_api,
+                tls_no_verify_api,
             )
             .await
         }))
@@ -274,8 +368,8 @@ where
                 &crate::app_state::RaftType::Cache,
                 node_id,
                 &nodes,
-                tls_raft,
-                tls_no_verify,
+                tls_api,
+                tls_no_verify_api,
             )
             .await
         }))
@@ -289,8 +383,7 @@ where
     let client = Client::new_local(
         state,
         tls_api_client_config,
-        #[cfg(feature = "cache")]
-        tls_no_verify,
+        tls_no_verify_api,
         #[cfg(feature = "sqlite")]
         tx_client_stream,
         #[cfg(feature = "sqlite")]
@@ -303,7 +396,6 @@ where
     )
     .await;
 
-    // TODO fix that and also start backup cron jobs with no S3 config
     #[cfg(feature = "backup")]
     backup::start_cron(
         client.clone(),
@@ -317,7 +409,7 @@ where
 
 /// The port will be split off from the `node_addr`
 fn build_listen_addr(listen_addr: &str, node_addr: &str, tls: bool) -> String {
-    let port = if let Some((_, port)) = node_addr.split_once(':') {
+    let port = if let Some((_, port)) = node_addr.rsplit_once(':') {
         port
     } else if tls {
         "443"

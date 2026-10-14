@@ -27,14 +27,17 @@ strip = false
 #s3-simple = { path = "../s3-simple" }
 
 [workspace.dependencies]
-argon2 = "0.5.3"
+argon2 = { version = "0.6", features = ["parallel", "zeroize"] }
 axum = { version = "0.8.1", features = ["http2", "tokio"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
 axum-server = { version = "0.8", features = [
     "tls-rustls",
     "tls-rustls-no-provider",
 ] }
+# only kept as a dev dependency for compat tests between this and *-next
+# can be removed after 0.15 or 0.16 with some safe margin
 bincode = { version = "2", features = ["serde"] }
+bincode-next = { version = "3.1.1", features = ["derive", "serde"] }
 byteorder = "1.4.3"
 bytes = "1.11.1"
 chrono = { version = "0.4.38", default-features = false, features = [
@@ -46,22 +49,21 @@ chrono = { version = "0.4.38", default-features = false, features = [
 ] }
 clap = { version = "4.1.11", features = ["derive", "env"] }
 console-subscriber = "0.5.0"
+constant_time_eq = "0.6"
 crc = "3.3.0"
+criterion = "0.8"
 cron = { version = "0.17" }
 crossbeam = "0.8.4"
 # `s3` is NOT requested here: every `cryptr::stream::s3` / `EncKeys` use in
 # this crate is already cfg-gated behind `s3`/`backup`/`dashboard`, but
-# requesting the feature unconditionally dragged `s3-simple` -> `quick-xml
-# 0.39` into every consumer's tree (RUSTSEC-2026-0194/0195) even for builds
-# with no S3 support. The `s3` feature now pulls `cryptr/s3` itself.
-cryptr = { version = "0.10", default-features = false }
+# requesting the feature unconditionally dragged `s3-simple` -> `quick-xml`
+# into every consumer's tree (RUSTSEC-2026-0194/0195 on the 0.39 line) even
+# for builds with no S3 support. The `s3` feature now pulls `cryptr/s3`
+# itself. (Fork delta, re-applied on top of upstream's cryptr 0.12 bump.)
+cryptr = { version = "0.12", default-features = false }
 ctrlc = { version = "3.4.4", features = ["termination"] }
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }
 dotenvy = "0.15.7"
-# TODO
-#  The new version requires weird 3rd party dependencies or lots of manual work for the Transport.
-#  This development is annoying and not worth it -> migrate to WebSocket in the future.
-eventsource-client = { version = "0.16" }
 fastwebsockets = { version = "0.10.0", features = [
     "upgrade",
     "with_axum",
@@ -77,46 +79,36 @@ hostname = "0.4.0"
 http-body-util = "0.1.2"
 hyper = { version = "1.4.1", features = ["client", "http2"] }
 hyper-util = { version = "0.1.6", features = ["client", "http2", "tokio"] }
+libc = "0.2"
 memmap2 = "0.9.5"
 mime_guess = "2.0.5"
 openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
-rcgen = "0.14.7"
-reqwest = { version = "0.13", default-features = false, features = [
+rcgen = "0.14.10"
+reqwest = { version = "0.13.4", default-features = false, features = [
     "charset",
     "http2",
     "json",
     "rustls-no-provider",
 ] }
-rusqlite = { version = "0.40", features = [
-    "backup",
-    "bundled",
-    "cache",
-    "chrono",
-    "modern_sqlite",
-    "column_decltype",
-    "csvtab",
-    "functions",
-    "load_extension",
-    "serde_json",
-    "series",
-    "url",
-    "uuid",
-    "vtab",
-] }
+# Only the features shared by every rusqlite consumer live here. The regular
+# `sqlite` feature adds its full set in `hiqlite/Cargo.toml`, so that
+# `external-state-machine` does not force them on downstream rusqlite users.
+rusqlite = { version = "0.40", features = ["bundled"] }
 rust-embed = { version = "8.5.0", features = [] }
 rustls = { version = "0.23.37", default-features = false, features = [
     "logging", "prefer-post-quantum", "std", "tls12", "ring"
 ] }
+rustls-platform-verifier = "0.7"
 serde = { version = "1.0.114", features = ["derive"] }
 serde_json = "1.0.57"
 serde_rusqlite = "0.43"
 sha2 = { version = "0.11", features = [] }
-spow = { version = "0.6", features = ["server"] }
+spow = { version = "0.7", features = ["server"] }
+socket2 = "0.6"
 thiserror = "2"
 thread-priority = "3.0.0"
 tikv-jemallocator = "0.7.0"
-# 0.3.52 introduced an invalid breaking change
-time = "=0.3.51"
+time = "0.3.51"
 tokio = { version = "1.43.1", features = ["fs", "sync", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", features = ["ring"] }
 toml = "1"
@@ -133,11 +125,4 @@ uuid = { version = "1.8.0", features = ["v7"] }
 webpki-root-certs = { version = "1" }
 
 # make minimal versions happy
-lazy_static = "1.0.2"
-lz4-sys = "1.9.5"
 rust_decimal = "1.15"
-tower-layer = "0.3.3"
-tower-service = "0.3.3"
-
-# Necessary to fix security issues in current versions.
-rustls-webpki = "0.103.13"

@@ -1,16 +1,17 @@
 use crate::Error;
 use crate::app_state::AppState;
+use crate::helpers::{deserialize, serialize, serialize_serde};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body};
+use bincode_next::{Decode, Encode};
+use constant_time_eq::constant_time_eq;
 use openraft::error::{ClientWriteError, InitializeError, InstallSnapshotError, RaftError};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-// pub use management::LearnerReq;
-use crate::helpers::{deserialize, serialize};
 pub use raft_client::NetworkStreaming;
 
 pub(crate) mod api;
@@ -19,10 +20,10 @@ pub(crate) mod handshake;
 pub(crate) mod management;
 mod raft_client;
 pub(crate) mod raft_server;
+pub(crate) mod tcp_socket;
 pub(crate) mod web_socket_connect;
 
 pub(crate) type AppStateExt = axum::extract::State<Arc<AppState>>;
-// pub(crate) type RaftWriteResponse = ClientWriteResponse<TypeConfigSqlite>;
 pub(crate) type RaftInitError = RaftError<u64, InitializeError<u64, crate::Node>>;
 pub(crate) type RaftSnapshotError = RaftError<u64, InstallSnapshotError>;
 pub(crate) type RaftWriteError = RaftError<u64, ClientWriteError<u64, crate::Node>>;
@@ -32,7 +33,7 @@ pub static HEADER_NAME_SECRET: &str = "X-API-SECRET";
 #[inline(always)]
 fn get_payload<T>(headers: &HeaderMap, body: body::Bytes) -> Result<T, Error>
 where
-    T: for<'a> Deserialize<'a>,
+    T: for<'a> Deserialize<'a> + Decode<()>,
 {
     if let Some(typ) = headers.get(CONTENT_TYPE)
         && typ == HeaderValue::from_static("application/json")
@@ -43,7 +44,10 @@ where
 }
 
 #[inline(always)]
-fn fmt_ok<S: Debug + Serialize>(headers: HeaderMap, payload: S) -> Result<Response, Error> {
+fn fmt_ok<S: Debug + Serialize + Encode>(
+    headers: HeaderMap,
+    payload: S,
+) -> Result<Response, Error> {
     if let Some(accept) = headers.get(ACCEPT)
         && accept == HeaderValue::from_static("application/json")
     {
@@ -52,11 +56,25 @@ fn fmt_ok<S: Debug + Serialize>(headers: HeaderMap, payload: S) -> Result<Respon
     Ok(serialize_network(&payload).into_response())
 }
 
+/// Like [`fmt_ok`], but for payloads owned by openraft (e.g. `Membership`, `RaftMetrics`):
+/// those stay on the byte-identical serde adapter instead of native Encode/Decode.
+#[inline(always)]
+fn fmt_ok_serde<S: Debug + Serialize>(headers: HeaderMap, payload: S) -> Result<Response, Error> {
+    if let Some(accept) = headers.get(ACCEPT)
+        && accept == HeaderValue::from_static("application/json")
+    {
+        return Ok(Json(payload).into_response());
+    }
+    Ok(serialize_serde(&payload)
+        .expect("Network payload serialization should always succeed")
+        .into_response())
+}
+
 /// Serialization used for all network requests for non-raft-internal traffic and types.
 /// # Panics
-/// If the given type cannot be serialized with bincode + serde successfully
+/// If the given type cannot be serialized with bincode-next successfully
 #[inline(always)]
-pub fn serialize_network<T: Serialize>(value: &T) -> Vec<u8> {
+pub fn serialize_network<T: Encode>(value: &T) -> Vec<u8> {
     serialize(value).expect("Network payload serialization should always succeed")
 }
 
@@ -65,7 +83,7 @@ fn validate_secret(state: &AppStateExt, headers: &HeaderMap) -> Result<(), Error
     match headers.get(HEADER_NAME_SECRET) {
         None => Err(Error::Token("API Secret missing".into())),
         Some(secret) => {
-            if state.secret_api.as_bytes() != secret.as_bytes() {
+            if !constant_time_eq(state.secret_api.as_bytes(), secret.as_bytes()) {
                 Err(Error::Token("Invalid API Secret".into()))
             } else {
                 Ok(())
