@@ -293,9 +293,9 @@ impl StateMachineMemory {
                             .into(),
                         ));
                     }
-                    stored
+                    Some(stored)
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::default(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => {
                     return Err(Error::Cache(
                         format!("cannot read cache index metadata {path_meta}: {err}").into(),
@@ -305,8 +305,15 @@ impl StateMachineMemory {
 
             // (Re)write the normalized form atomically so the file always reflects the
             // current enum and a torn write can never leave a half-written fingerprint.
+            //
+            // A missing file is always written, even when the normalized form is empty: the
+            // file is also the marker `v0_15_auto_cache_migration::check_migrate` uses to tell
+            // cache data written by this version from pre-0.15 data. A cache enum without
+            // variants (`start_node` with `dlock` / `listen_notify` / `counters`) normalizes to
+            // "", which compared equal to a missing file, so the marker was never written and
+            // every restart of such a node was refused as an un-migrated pre-0.15 cache.
             let normalized = C::hiqlite_cache_variants_normalized();
-            if stored.as_bytes() != normalized.as_bytes() {
+            if stored.as_deref() != Some(normalized.as_str()) {
                 let path_temp = format!("{path_meta}~");
                 {
                     let mut file = fs::File::create(&path_temp).await.map_err(|err| {
