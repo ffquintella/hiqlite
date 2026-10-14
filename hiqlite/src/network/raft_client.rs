@@ -6,6 +6,7 @@ use crate::network::raft_server::{
     RaftStreamRequest, RaftStreamResponse, RaftStreamResponsePayload,
 };
 use crate::network::web_socket_connect;
+use crate::network::ws_diagnostics::{log_if_exceeds_ws_limit, log_ws_read_error};
 use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, WebSocketWrite};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -300,14 +301,21 @@ impl NetworkStreaming {
             // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
             let read = FragmentCollectorRead::new(read);
 
+            let peer = format!(
+                "{:?} Raft member node {} ({})",
+                raft_type, node.id, node.addr_raft
+            );
+
             // Guarded: `ws_handler` may be aborted before it reaches the
             // aborts below, and these must then cancel and not detach.
             let handle_read = AbortOnDrop(task::spawn(Box::pin(Self::stream_reader(
                 read,
                 tx_read.clone(),
+                peer.clone(),
             ))));
-            let handle_write =
-                AbortOnDrop(task::spawn(Box::pin(Self::stream_writer(write, rx_write))));
+            let handle_write = AbortOnDrop(task::spawn(Box::pin(Self::stream_writer(
+                write, rx_write, peer,
+            ))));
 
             loop {
                 let res = select! {
@@ -424,22 +432,33 @@ impl NetworkStreaming {
         debug!("Raft Client shut down, tx closed, exiting WsHandler");
     }
 
+    /// `peer` names the cluster member this connection was opened to, for the logs.
     async fn stream_reader(
         mut read: FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>,
         tx: flume::Sender<RaftRequest>,
+        peer: String,
     ) {
-        while let Ok(frame) = read
-            .read_frame(&mut |frame| async move {
-                // TODO obligated sends should be auto ping / pong / close ? -> verify!
-                debug!(
-                    "Received obligated send in stream client: OpCode: {:?}: {:?}",
-                    frame.opcode.clone(),
-                    frame.payload
-                );
-                Ok::<(), Error>(())
-            })
-            .await
-        {
+        loop {
+            let frame = match read
+                .read_frame(&mut |frame| async move {
+                    // TODO obligated sends should be auto ping / pong / close ? -> verify!
+                    debug!(
+                        "Received obligated send in stream client: OpCode: {:?}: {:?}",
+                        frame.opcode.clone(),
+                        frame.payload
+                    );
+                    Ok::<(), Error>(())
+                })
+                .await
+            {
+                Ok(frame) => frame,
+                Err(err) => {
+                    // Never silent: the reconnect that follows fails every in-flight Raft RPC.
+                    log_ws_read_error("Raft client stream", &peer, &err);
+                    break;
+                }
+            };
+
             match frame.opcode {
                 OpCode::Continuation => {}
                 OpCode::Text => {}
@@ -450,7 +469,11 @@ impl NetworkStreaming {
                         Err(err) => {
                             // corrupt frame from a cluster member: drop the connection instead
                             // of panicking the raft client task
-                            error!("Error deserializing raft response from member: {err:?}");
+                            error!(
+                                "Raft client stream: error deserializing a {} byte response from \
+                                 {peer} - closing the connection: {err:?}",
+                                bytes.len()
+                            );
                             break;
                         }
                     };
@@ -474,10 +497,14 @@ impl NetworkStreaming {
     async fn stream_writer(
         mut write: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         rx: flume::Receiver<WritePayload>,
+        peer: String,
     ) {
         while let Ok(payload) = rx.recv_async().await {
             match payload {
                 WritePayload::Payload(bytes) => {
+                    // A Raft request this large (e.g. a big AppendEntries batch) is rejected by
+                    // the member, and openraft retries it as-is, so say why replication stalls.
+                    log_if_exceeds_ws_limit("Raft client stream", &peer, bytes.len());
                     let frame = Frame::binary(Payload::from(bytes));
                     if let Err(err) = write.write_frame(frame).await {
                         error!("Client Stream error: {:?}", err);

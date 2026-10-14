@@ -1,6 +1,7 @@
 use crate::app_state::RaftType;
 use crate::helpers::{serialize, serialize_serde};
 use crate::network::handshake::HandshakeSecret;
+use crate::network::ws_diagnostics::log_ws_read_error;
 use crate::server::proxy::state::AppStateProxy;
 use crate::server::proxy::stream;
 use crate::store::state_machine::memory::notify_handler::NotifyRequest;
@@ -52,13 +53,16 @@ async fn handle_listen_socket(
     let mut ws = socket.await?;
     ws.set_auto_close(true);
 
-    if let Err(err) = HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
-        error!("Error during /listen WebSocket handshake: {}", err);
-        let _ = ws
-            .write_frame(Frame::close(1000, b"Invalid Handshake"))
-            .await;
-        return Ok(());
-    }
+    let client_id = match HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
+        Ok(id) => id,
+        Err(err) => {
+            error!("Error during /listen WebSocket handshake: {}", err);
+            let _ = ws
+                .write_frame(Frame::close(1000, b"Invalid Handshake"))
+                .await;
+            return Ok(());
+        }
+    };
 
     // Register this connection as a listener with the state machine.
     let (tx_notify, rx_notify) = flume::unbounded::<(i64, Vec<u8>)>();
@@ -78,21 +82,32 @@ async fn handle_listen_socket(
     // The client pings for keepalive; echo the obligated sends (Pong / Close) back to the socket.
     let (tx_obligated, rx_obligated) = flume::bounded::<(OpCode, Vec<u8>)>(1);
     let handle_read = tokio::task::spawn(async move {
-        while let Ok(frame) = read
-            .read_frame(&mut |frame| {
-                let tx_obligated = tx_obligated.clone();
-                async move {
-                    if let Err(err) = tx_obligated
-                        .send_async((frame.opcode, frame.payload.to_vec()))
-                        .await
-                    {
-                        error!("/listen: failed to forward obligated frame: {}", err);
+        loop {
+            let frame = match read
+                .read_frame(&mut |frame| {
+                    let tx_obligated = tx_obligated.clone();
+                    async move {
+                        if let Err(err) = tx_obligated
+                            .send_async((frame.opcode, frame.payload.to_vec()))
+                            .await
+                        {
+                            error!("/listen: failed to forward obligated frame: {}", err);
+                        }
+                        Ok::<(), Error>(())
                     }
-                    Ok::<(), Error>(())
+                })
+                .await
+            {
+                Ok(frame) => frame,
+                Err(err) => {
+                    log_ws_read_error(
+                        "Proxy /listen server stream",
+                        format_args!("client node {client_id}"),
+                        &err,
+                    );
+                    break;
                 }
-            })
-            .await
-        {
+            };
             if frame.opcode == OpCode::Close {
                 break;
             }

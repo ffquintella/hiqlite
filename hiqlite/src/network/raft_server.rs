@@ -1,5 +1,6 @@
 use crate::helpers::{deserialize_serde, serialize_serde};
 use crate::network::handshake::HandshakeSecret;
+use crate::network::ws_diagnostics::log_ws_read_error;
 use crate::network::{AppStateExt, Error};
 use axum::response::IntoResponse;
 use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, upgrade};
@@ -143,12 +144,15 @@ async fn handle_socket(
     let mut ws = socket.await?;
     ws.set_auto_close(true);
 
-    if let Err(err) = HandshakeSecret::server(&mut ws, state.secret_raft.as_bytes()).await {
-        error!("Error during WebSocket handshake: {}", err);
-        ws.write_frame(Frame::close(1000, b"Invalid Handshake"))
-            .await?;
-        return Ok(());
-    }
+    let peer = match HandshakeSecret::server(&mut ws, state.secret_raft.as_bytes()).await {
+        Ok(node_id) => format!("Raft member node {node_id}"),
+        Err(err) => {
+            error!("Error during WebSocket handshake: {}", err);
+            ws.write_frame(Frame::close(1000, b"Invalid Handshake"))
+                .await?;
+            return Ok(());
+        }
+    };
 
     let (tx_write, rx_write) = flume::bounded::<WsWriteMsg>(1);
     let (rx, mut write) = ws.split(tokio::io::split);
@@ -189,29 +193,38 @@ async fn handle_socket(
         let _ = write.write_frame(Frame::close(1000, b"go away")).await;
     });
 
-    while let Ok(frame) = read
-        .read_frame(&mut |frame| {
-            // The library generates the obligated frame (Pong for Ping, Close echo) and
-            // expects us to send it back on the socket - forward it to the writer task.
-            let tx_write = tx_write.clone();
-            async move {
-                if let Err(err) = tx_write
-                    .send_async(WsWriteMsg::ObligatedSend {
-                        opcode: frame.opcode,
-                        payload: frame.payload.to_vec(),
-                    })
-                    .await
-                {
-                    error!(
-                        "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
-                        frame.opcode, err
-                    );
+    loop {
+        let frame = match read
+            .read_frame(&mut |frame| {
+                // The library generates the obligated frame (Pong for Ping, Close echo) and
+                // expects us to send it back on the socket - forward it to the writer task.
+                let tx_write = tx_write.clone();
+                async move {
+                    if let Err(err) = tx_write
+                        .send_async(WsWriteMsg::ObligatedSend {
+                            opcode: frame.opcode,
+                            payload: frame.payload.to_vec(),
+                        })
+                        .await
+                    {
+                        error!(
+                            "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
+                            frame.opcode, err
+                        );
+                    }
+                    Ok::<(), Error>(())
                 }
-                Ok::<(), Error>(())
+            })
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                // e.g. FrameTooLarge for an AppendEntries batch / snapshot chunk of 64 MiB or more
+                log_ws_read_error("Raft server stream", &peer, &err);
+                break;
             }
-        })
-        .await
-    {
+        };
+
         let req = match frame.opcode {
             OpCode::Close => {
                 debug!("received Close frame in server stream");

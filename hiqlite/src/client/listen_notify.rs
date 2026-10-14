@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 pub(crate) mod remote {
     use crate::helpers::deserialize;
     use crate::network::web_socket_connect;
+    use crate::network::ws_diagnostics::log_ws_read_error;
     use crate::{Error, NodeId};
     use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, WebSocket};
     use hyper::upgrade::Upgraded;
@@ -116,7 +117,11 @@ pub(crate) mod remote {
                 // the handler only selects on the channel it feeds (mirrors client/stream.rs).
                 let read = FragmentCollectorRead::new(read_half);
                 let (tx_read, rx_read) = flume::bounded(1);
-                let handle_read = task::spawn(Self::listen_reader(read, tx_read));
+                let peer = {
+                    let lock = leader_cache.read().await;
+                    format!("leader node {} ({})", lock.0, lock.1)
+                };
+                let handle_read = task::spawn(Self::listen_reader(read, tx_read, peer));
 
                 // Liveness tracking: any frame from the server resets `last_frame`. A healthy connection
                 // always produces inbound traffic within LISTEN_READ_TIMEOUT because we ping every
@@ -184,21 +189,32 @@ pub(crate) mod remote {
 
         /// Reads frames off the /listen socket and reports deserialized events (or liveness pongs) to
         /// `tx`. Runs in its own task because the fastwebsockets reader is not cancel-safe.
+        /// `peer` names the leader the socket was opened to, for the logs.
         async fn listen_reader(
             mut read: FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>,
             tx: flume::Sender<ListenRead>,
+            peer: String,
         ) {
-            while let Ok(frame) = read
-                .read_frame(&mut |frame| async move {
-                    debug!(
-                        "Received obligated send in /listen client: OpCode: {:?}: {:?}",
-                        frame.opcode.clone(),
-                        frame.payload
-                    );
-                    Ok::<(), Error>(())
-                })
-                .await
-            {
+            loop {
+                let frame = match read
+                    .read_frame(&mut |frame| async move {
+                        debug!(
+                            "Received obligated send in /listen client: OpCode: {:?}: {:?}",
+                            frame.opcode.clone(),
+                            frame.payload
+                        );
+                        Ok::<(), Error>(())
+                    })
+                    .await
+                {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        // Dropping `tx` on return makes the handler reconnect.
+                        log_ws_read_error("Client /listen stream", &peer, &err);
+                        break;
+                    }
+                };
+
                 match frame.opcode {
                     OpCode::Binary => {
                         let bytes = frame.payload.deref();

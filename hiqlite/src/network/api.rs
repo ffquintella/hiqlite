@@ -1,6 +1,7 @@
 use crate::app_state::RaftType;
 use crate::helpers::{deserialize, get_raft_metrics, serialize};
 use crate::network::handshake::HandshakeSecret;
+use crate::network::ws_diagnostics::{log_if_exceeds_ws_limit, log_ws_read_error};
 use crate::network::{AppStateExt, Error, validate_secret};
 use crate::{APP_VERSION, Node};
 use axum::extract::Path;
@@ -356,13 +357,16 @@ async fn handle_listen_socket(
     let mut ws = socket.await?;
     ws.set_auto_close(true);
 
-    if let Err(err) = HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
-        error!("Error during /listen WebSocket handshake: {}", err);
-        let _ = ws
-            .write_frame(Frame::close(1000, b"Invalid Handshake"))
-            .await;
-        return Ok(());
-    }
+    let client_id = match HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
+        Ok(id) => id,
+        Err(err) => {
+            error!("Error during /listen WebSocket handshake: {}", err);
+            let _ = ws
+                .write_frame(Frame::close(1000, b"Invalid Handshake"))
+                .await;
+            return Ok(());
+        }
+    };
 
     // Register this connection as a listener with the state machine.
     let (tx_notify, rx_notify) = flume::unbounded();
@@ -383,21 +387,32 @@ async fn handle_listen_socket(
     // The client pings for keepalive; echo the obligated sends (Pong / Close) back to the socket.
     let (tx_obligated, rx_obligated) = flume::bounded::<(OpCode, Vec<u8>)>(1);
     let handle_read = task::spawn(async move {
-        while let Ok(frame) = read
-            .read_frame(&mut |frame| {
-                let tx_obligated = tx_obligated.clone();
-                async move {
-                    if let Err(err) = tx_obligated
-                        .send_async((frame.opcode, frame.payload.to_vec()))
-                        .await
-                    {
-                        error!("/listen: failed to forward obligated frame: {}", err);
+        loop {
+            let frame = match read
+                .read_frame(&mut |frame| {
+                    let tx_obligated = tx_obligated.clone();
+                    async move {
+                        if let Err(err) = tx_obligated
+                            .send_async((frame.opcode, frame.payload.to_vec()))
+                            .await
+                        {
+                            error!("/listen: failed to forward obligated frame: {}", err);
+                        }
+                        Ok::<(), Error>(())
                     }
-                    Ok::<(), Error>(())
+                })
+                .await
+            {
+                Ok(frame) => frame,
+                Err(err) => {
+                    log_ws_read_error(
+                        "/listen server stream",
+                        format_args!("client node {client_id}"),
+                        &err,
+                    );
+                    break;
                 }
-            })
-            .await
-        {
+            };
             if frame.opcode == OpCode::Close {
                 break;
             }
@@ -591,7 +606,7 @@ async fn handle_socket_concurrent(
     let mut ws = socket.await?;
     ws.set_auto_close(true);
 
-    let _client_id = match HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
+    let client_id = match HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
         Ok(id) => id,
         Err(err) => {
             error!("Error during WebSocket handshake: {}", err);
@@ -608,6 +623,8 @@ async fn handle_socket_concurrent(
     // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
     let mut read = FragmentCollectorRead::new(rx);
 
+    let peer = format!("client node {client_id}");
+    let writer_peer = peer.clone();
     let handle_write = task::spawn(async move {
         while let Ok(req) = rx_write.recv_async().await {
             match req {
@@ -622,9 +639,16 @@ async fn handle_socket_concurrent(
                             break;
                         }
                     };
+                    // Leader side of the FrameTooLarge failure: without this line the only trace
+                    // here is the "Connection reset by peer" of a later write.
+                    log_if_exceeds_ws_limit(
+                        "Client API server stream",
+                        format_args!("{writer_peer} (response to request {})", resp.request_id),
+                        bytes.len(),
+                    );
                     let frame = Frame::binary(Payload::Borrowed(&bytes));
                     if let Err(err) = write.write_frame(frame).await {
-                        error!("Error during WebSocket write: {}", err);
+                        error!("Error during WebSocket write to {writer_peer}: {}", err);
                         break;
                     }
                 }
@@ -657,29 +681,38 @@ async fn handle_socket_concurrent(
         debug!("handle_socket_concurrent -> server stream exiting");
     });
 
-    while let Ok(frame) = read
-        .read_frame(&mut |frame| {
-            // The library generates the obligated frame (Pong for Ping, Close echo) and
-            // expects us to send it back on the socket - forward it to the writer task.
-            let tx_write = tx_write.clone();
-            async move {
-                if let Err(err) = tx_write
-                    .send_async(WsWriteMsg::ObligatedSend {
-                        opcode: frame.opcode,
-                        payload: frame.payload.to_vec(),
-                    })
-                    .await
-                {
-                    error!(
-                        "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
-                        frame.opcode, err
-                    );
+    loop {
+        let frame = match read
+            .read_frame(&mut |frame| {
+                // The library generates the obligated frame (Pong for Ping, Close echo) and
+                // expects us to send it back on the socket - forward it to the writer task.
+                let tx_write = tx_write.clone();
+                async move {
+                    if let Err(err) = tx_write
+                        .send_async(WsWriteMsg::ObligatedSend {
+                            opcode: frame.opcode,
+                            payload: frame.payload.to_vec(),
+                        })
+                        .await
+                    {
+                        error!(
+                            "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
+                            frame.opcode, err
+                        );
+                    }
+                    Ok::<(), Error>(())
                 }
-                Ok::<(), Error>(())
+            })
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                // The `Break` after this loop closes the writer.
+                log_ws_read_error("Client API server stream", &peer, &err);
+                break;
             }
-        })
-        .await
-    {
+        };
+
         let req = match frame.opcode {
             OpCode::Close => {
                 debug!("received Close frame in server stream");

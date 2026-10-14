@@ -1,6 +1,7 @@
 use crate::app_state::RaftType;
 use crate::helpers::deserialize;
 use crate::network::api::{ApiStreamResponse, ApiStreamResponsePayload};
+use crate::network::ws_diagnostics::{log_if_exceeds_ws_limit, log_ws_read_error};
 use crate::network::{serialize_network, web_socket_connect};
 use crate::{Client, Error, Node, NodeId};
 use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketWrite};
@@ -83,6 +84,10 @@ pub(crate) enum ClientStreamReq {
     CleanupBuffer,
     /// keepalive ping/pong traffic from the server; proves the connection is alive
     Liveness,
+    /// The reader stopped (read error, Close frame or undecodable response). No response can
+    /// arrive on this connection anymore, so the manager must reconnect right away instead of
+    /// waiting for STREAM_READ_TIMEOUT while it keeps sending requests into a dead socket.
+    ReaderExit,
 
     // may come from `DbClient` or WebSocket reader
     LeaderChange((Option<u64>, Option<Node>)),
@@ -190,7 +195,7 @@ async fn client_stream(
     let mut failed_retries: u32 = 0;
 
     loop {
-        let ws = match try_connect(
+        let (ws, peer) = match try_connect(
             &leader,
             &raft_type,
             client.inner.tls_config.clone(),
@@ -200,11 +205,12 @@ async fn client_stream(
         {
             Ok(ws) => {
                 failed_retries = 0;
-                info!(
-                    "Client API WebSocket to {} opened successfully",
-                    leader.read().await.1
-                );
-                ws
+                let peer = {
+                    let lock = leader.read().await;
+                    format!("leader node {} ({})", lock.0, lock.1)
+                };
+                info!("Client API WebSocket to {} opened successfully", peer);
+                (ws, peer)
             }
             Err(err) => {
                 if let Error::Connect(_) = &err {
@@ -239,8 +245,8 @@ async fn client_stream(
         // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
         let read = FragmentCollectorRead::new(rx);
 
-        let handle_read = task::spawn(stream_reader(read, tx_read.clone()));
-        let handle_write = task::spawn(stream_writer(write, rx_write));
+        let handle_read = task::spawn(stream_reader(read, tx_read.clone(), peer.clone()));
+        let handle_write = task::spawn(stream_writer(write, rx_write, peer));
 
         let handle_buf = cleanup_buffer_timeout(tx_read, 10);
         let mut awaiting_timeout = true;
@@ -541,6 +547,25 @@ async fn client_stream(
                     None
                 }
 
+                ClientStreamReq::ReaderExit => {
+                    // The reader already logged why it stopped. Responses for the requests in
+                    // flight can never arrive on this connection, so fail them now.
+                    if in_flight.is_empty() {
+                        info!("Client API stream reader exited - reconnecting");
+                    } else {
+                        error!(
+                            "Client API stream reader exited - failing {} in-flight request(s) \
+                             and reconnecting",
+                            in_flight.len()
+                        );
+                    }
+                    for (_, ack) in in_flight.drain() {
+                        let _ =
+                            ack.send(Err(Error::Connect("Connection to Raft leader lost".into())));
+                    }
+                    break;
+                }
+
                 ClientStreamReq::CleanupBuffer => {
                     for (_, ack) in in_flight_buf {
                         let _ = ack.send(Err(Error::Connect("request timed out".to_string())));
@@ -653,6 +678,9 @@ async fn client_stream(
                 ClientStreamReq::Liveness => {
                     // ignore - we are re-connecting anyway
                 }
+                ClientStreamReq::ReaderExit => {
+                    // ignore - we are re-connecting anyway
+                }
             }
         }
 
@@ -737,22 +765,34 @@ fn cleanup_buffer_timeout(tx: flume::Sender<ClientStreamReq>, seconds: u64) -> J
     })
 }
 
+/// `peer` names the leader this connection was opened to, for the logs.
 async fn stream_reader(
     mut read: FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>,
     tx: flume::Sender<ClientStreamReq>,
+    peer: String,
 ) {
-    while let Ok(frame) = read
-        .read_frame(&mut |frame| async move {
-            // TODO obligated sends should be auto ping / pong / close ? -> verify!
-            debug!(
-                "Received obligated send in stream client: OpCode: {:?}: {:?}",
-                frame.opcode.clone(),
-                frame.payload
-            );
-            Ok::<(), Error>(())
-        })
-        .await
-    {
+    loop {
+        let frame = match read
+            .read_frame(&mut |frame| async move {
+                // TODO obligated sends should be auto ping / pong / close ? -> verify!
+                debug!(
+                    "Received obligated send in stream client: OpCode: {:?}: {:?}",
+                    frame.opcode.clone(),
+                    frame.payload
+                );
+                Ok::<(), Error>(())
+            })
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                // Never silent: a read error (e.g. FrameTooLarge for a response of 64 MiB or
+                // more) ends the connection and fails every request in flight on it.
+                log_ws_read_error("Client API stream", &peer, &err);
+                break;
+            }
+        };
+
         match frame.opcode {
             OpCode::Continuation => {}
             OpCode::Text => {}
@@ -763,7 +803,11 @@ async fn stream_reader(
                     Err(err) => {
                         // corrupt frame from the server: do not panic the reader task, just
                         // drop the connection so the client can reconnect
-                        error!("Error deserializing response from server: {err:?}");
+                        error!(
+                            "Client API stream: error deserializing a {} byte response from \
+                             {peer} - closing the connection: {err:?}",
+                            bytes.len()
+                        );
                         break;
                     }
                 };
@@ -774,7 +818,10 @@ async fn stream_reader(
                     error!("Error sending Response to Client Stream Manager: {:?}", err);
                 }
             }
-            OpCode::Close => break,
+            OpCode::Close => {
+                debug!("Client API stream: Close frame from {peer}");
+                break;
+            }
             // keepalive traffic from the server (auto-pong of our pings): forward it as a liveness
             // marker so the manager can enforce the read deadline. Ping frames are normally
             // consumed by auto_pong and never reach here.
@@ -786,16 +833,21 @@ async fn stream_reader(
         }
     }
 
+    // Tell the manager right away, so it reconnects instead of waiting for STREAM_READ_TIMEOUT.
+    let _ = tx.send_async(ClientStreamReq::ReaderExit).await;
     debug!("Exiting Client Stream Reader");
 }
 
 async fn stream_writer(
     mut write: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
     rx: flume::Receiver<WritePayload>,
+    peer: String,
 ) {
     while let Ok(payload) = rx.recv_async().await {
         match payload {
             WritePayload::Payload(bytes) => {
+                // The leader rejects a request this large and drops the whole connection.
+                log_if_exceeds_ws_limit("Client API stream", &peer, bytes.len());
                 let frame = Frame::binary(Payload::from(bytes));
                 if let Err(err) = write.write_frame(frame).await {
                     error!("Client Stream error: {:?}", err);
