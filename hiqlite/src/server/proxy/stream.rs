@@ -4,6 +4,7 @@ use crate::network::api::{
     WsWriteMsg,
 };
 use crate::network::handshake::HandshakeSecret;
+use crate::network::ws_diagnostics::{log_if_exceeds_ws_limit, log_ws_read_error};
 use crate::server::proxy::handlers::AppStateExt;
 use crate::store::state_machine::sqlite::state_machine::Query;
 use crate::{Client, Error};
@@ -19,11 +20,14 @@ pub async fn handle_socket(
     let mut ws = socket.await?;
     ws.set_auto_close(true);
 
-    if let Err(err) = HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
-        error!("Error during WebSocket handshake: {}", err);
-        ws.write_frame(Frame::close(1000, b"Invalid Handshake"))
-            .await?;
-        return Ok(());
+    let peer = match HandshakeSecret::server(&mut ws, state.secret_api.as_bytes()).await {
+        Ok(client_id) => format!("client node {client_id}"),
+        Err(err) => {
+            error!("Error during WebSocket handshake: {}", err);
+            ws.write_frame(Frame::close(1000, b"Invalid Handshake"))
+                .await?;
+            return Ok(());
+        }
     };
 
     let (tx_write, rx_write) = flume::bounded::<WsWriteMsg>(1);
@@ -33,6 +37,7 @@ pub async fn handle_socket(
     // IMPORTANT: the reader is NOT CANCEL SAFE in v0.8!
     let mut read = FragmentCollectorRead::new(rx);
 
+    let writer_peer = peer.clone();
     let handle_write = task::spawn(async move {
         while let Ok(req) = rx_write.recv_async().await {
             match req {
@@ -47,6 +52,11 @@ pub async fn handle_socket(
                             break;
                         }
                     };
+                    log_if_exceeds_ws_limit(
+                        "Proxy API server stream",
+                        format_args!("{writer_peer} (response to request {})", resp.request_id),
+                        bytes.len(),
+                    );
                     let frame = Frame::binary(Payload::Borrowed(&bytes));
                     if let Err(err) = write.write_frame(frame).await {
                         error!("Error during WebSocket write: {}", err);
@@ -82,29 +92,37 @@ pub async fn handle_socket(
         debug!("server stream exiting");
     });
 
-    while let Ok(frame) = read
-        .read_frame(&mut |frame| {
-            // The library generates the obligated frame (Pong for Ping, Close echo) and
-            // expects us to send it back on the socket - forward it to the writer task.
-            let tx_write = tx_write.clone();
-            async move {
-                if let Err(err) = tx_write
-                    .send_async(WsWriteMsg::ObligatedSend {
-                        opcode: frame.opcode,
-                        payload: frame.payload.to_vec(),
-                    })
-                    .await
-                {
-                    error!(
-                        "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
-                        frame.opcode, err
-                    );
+    loop {
+        let frame = match read
+            .read_frame(&mut |frame| {
+                // The library generates the obligated frame (Pong for Ping, Close echo) and
+                // expects us to send it back on the socket - forward it to the writer task.
+                let tx_write = tx_write.clone();
+                async move {
+                    if let Err(err) = tx_write
+                        .send_async(WsWriteMsg::ObligatedSend {
+                            opcode: frame.opcode,
+                            payload: frame.payload.to_vec(),
+                        })
+                        .await
+                    {
+                        error!(
+                            "Error forwarding obligated WebSocket frame to writer (OpCode {:?}): {}",
+                            frame.opcode, err
+                        );
+                    }
+                    Ok::<(), Error>(())
                 }
-                Ok::<(), Error>(())
+            })
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                log_ws_read_error("Proxy API server stream", &peer, &err);
+                break;
             }
-        })
-        .await
-    {
+        };
+
         let req = match frame.opcode {
             OpCode::Close => {
                 debug!("received Close frame in server stream");

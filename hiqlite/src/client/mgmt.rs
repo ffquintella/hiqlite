@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "cache")]
 use crate::network::management::{self, ClusterLeaveReq};
@@ -604,8 +604,17 @@ impl Client {
         }
 
         if let Some(tx) = tx_shutdown {
-            tx.send(true)
-                .expect("The global Hiqlite shutdown handler to always listen");
+            // No receivers left means the graceful-shutdown watchers of the API /
+            // internal HTTP servers are already gone. At this point the Raft and
+            // all writers have shut down cleanly, so that is not a reason to
+            // panic. `send_replace` (unlike `send`) also stores `true` when
+            // nobody listens, so a later repeat `shutdown()` that loses the
+            // `is_shutting_down` race above sees completion immediately instead
+            // of waiting for its outer timeout.
+            if tx.receiver_count() == 0 {
+                warn!("Global Hiqlite shutdown handler no longer listening");
+            }
+            tx.send_replace(true);
         }
 
         info!("Shutdown complete");
