@@ -26,10 +26,12 @@
 //! without running the operation again. Older retries return
 //! [`ExternalError::ReceiptUnavailable`](crate::external_state_machine::ExternalError::ReceiptUnavailable).
 //!
-//! Coordinates use Hiqlite's bincode-next legacy encoding on disk. Operation
-//! outputs use that encoding by default, while protocol owners may override
+//! Coordinates are persisted through [`ExternalCodec`](crate::external_state_machine::ExternalCodec),
+//! a dependency-free encoding that matches the legacy bincode layout used by
+//! earlier releases; most coordinates need only
+//! [`external_codec!`](crate::external_codec). Operation outputs are encoded by
 //! [`DeterministicSqliteOperation::encode_receipt`](crate::external_state_machine::DeterministicSqliteOperation::encode_receipt)
-//! and its decoder. `C`, the selected output codec, and
+//! and its decoder, which the protocol owner implements. `C`, the selected output codec, and
 //! [`DeterministicSqliteOperation::RECEIPT_CODEC`](crate::external_state_machine::DeterministicSqliteOperation::RECEIPT_CODEC)
 //! must remain backward-decodable for every retained receipt and snapshot.
 //! `receipt_schema` is identity evidence for the caller; this first version
@@ -78,9 +80,9 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -97,9 +99,9 @@ use uuid::Uuid;
 
 type SqlitePool = deadpool::unmanaged::Pool<Connection>;
 
-fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, bincode_next::error::EncodeError> {
-    bincode_next::serde::encode_to_vec(value, bincode_next::config::legacy())
-}
+mod codec;
+
+pub use codec::ExternalCodec;
 
 async fn set_path_access(path: &str, mode: u32) -> Result<(), std::io::Error> {
     #[cfg(target_family = "unix")]
@@ -214,6 +216,10 @@ fn restore_snapshot(conn: &mut Connection, path: &Path) -> Result<(), rusqlite::
             let _ = progress;
         }),
     )
+}
+
+thread_local! {
+    static INTERNAL_SQLITE_PHASE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// On-disk format version of external state-machine metadata and receipts.
@@ -379,7 +385,7 @@ impl<C> ExternalApplied<C> {
 /// rejections must be represented inside `Ok(Output)` so the committed entry
 /// advances and the same response can be recovered after a lost reply.
 pub trait DeterministicSqliteOperation: Send + 'static {
-    type Output: Serialize + DeserializeOwned + Send + 'static;
+    type Output: Send + 'static;
     type Error: Send + 'static;
 
     /// Stable caller-owned receipt codec name and version.
@@ -389,24 +395,15 @@ pub trait DeterministicSqliteOperation: Send + 'static {
 
     /// Encodes the durable lost-response receipt.
     ///
-    /// The default retains Hiqlite's legacy bincode-next representation. Protocol
-    /// owners may override both codec methods to own a stable canonical format.
-    fn encode_receipt(output: &Self::Output) -> Result<Vec<u8>, String> {
-        serialize(output).map_err(|err| err.to_string())
-    }
+    /// Outputs that implement [`ExternalCodec`] can return
+    /// `Ok(output.to_external_bytes())`.
+    fn encode_receipt(output: &Self::Output) -> Result<Vec<u8>, String>;
 
     /// Decodes one durable lost-response receipt.
-    fn decode_receipt(bytes: &[u8]) -> Result<Self::Output, String> {
-        let (output, consumed) = bincode_next::serde::decode_from_slice::<Self::Output, _>(
-            bytes,
-            bincode_next::config::legacy(),
-        )
-        .map_err(|err| err.to_string())?;
-        if consumed != bytes.len() {
-            return Err("receipt contains trailing bytes".to_string());
-        }
-        Ok(output)
-    }
+    ///
+    /// Outputs that implement [`ExternalCodec`] can return
+    /// `Self::Output::from_external_bytes(bytes)`.
+    fn decode_receipt(bytes: &[u8]) -> Result<Self::Output, String>;
 }
 
 /// Result of a new application or an exact retained retry.
@@ -807,7 +804,7 @@ struct ExternalReadPoolConfig {
 
 impl<C, O> ExternalSqlite<C, O>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned + Send + 'static,
+    C: Clone + Debug + Eq + ExternalCodec + Send + 'static,
     O: DeterministicSqliteOperation,
 {
     /// Opens the external engine without creating any Raft or network runtime.
@@ -1024,9 +1021,17 @@ where
         let (ack, rx) = oneshot::channel();
         let thunk = Box::new(move |conn: &mut Connection, state: &mut StoredState<C>| {
             let mut result = apply_operation::<C, O>(conn, state, commit, operation);
-            let poison = reconcile_after_apply::<C, O>(conn, state, result.is_err())
+            let mut poison = reconcile_after_apply::<C, O>(conn, state, result.is_err())
                 .err()
                 .map(|err| err.to_string());
+            if let Err(err) = conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>) {
+                let message = format!("cannot clear the operation guard: {err}");
+                poison = Some(
+                    poison
+                        .map(|prev| format!("{prev}; {message}"))
+                        .unwrap_or(message),
+                );
+            }
             if let Some(message) = poison.as_ref() {
                 result = Err(ExternalError::WriterPoisoned(message.clone()).into());
             }
@@ -1311,7 +1316,7 @@ fn spawn_external_writer<C, O>(
     _owner_lock: File,
 ) -> flume::Sender<WriterRequest<C>>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned + Send + 'static,
+    C: Clone + Debug + Eq + ExternalCodec + Send + 'static,
     O: DeterministicSqliteOperation,
 {
     let (tx, rx) = flume::bounded(1);
@@ -1447,7 +1452,7 @@ fn apply_operation<C, O>(
     operation: O,
 ) -> Result<ApplyOutcome<O::Output>, ExternalApplyError<O::Error>>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
     O: DeterministicSqliteOperation,
 {
     match classify_commit(
@@ -1465,17 +1470,17 @@ where
         CommitClass::New => {}
     }
 
+    conn.authorizer(Some(external_operation_authorizer))
+        .map_err(ExternalError::from)?;
+    let phase = InternalSqlitePhase::enter();
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(ExternalError::from)?;
-    transaction
-        .authorizer(Some(external_operation_authorizer))
-        .map_err(ExternalError::from)?;
-    let operation_result = operation.apply(&transaction);
-    transaction
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
-        .map_err(ExternalError::from)?;
-    let output = operation_result.map_err(ExternalApplyError::Operation)?;
+    drop(phase);
+
+    let output = operation
+        .apply(&transaction)
+        .map_err(ExternalApplyError::Operation)?;
     let receipt = O::encode_receipt(&output).map_err(ExternalError::Serialization)?;
     if receipt.len() > state.max_receipt_bytes {
         return Err(ExternalError::ReceiptTooLarge {
@@ -1485,7 +1490,8 @@ where
         .into());
     }
     let receipt_digest = Sha256Digest::of(&receipt);
-    persist_new_commit(
+    let phase = InternalSqlitePhase::enter();
+    let persisted = persist_new_commit(
         &transaction,
         state,
         &commit,
@@ -1493,8 +1499,10 @@ where
         O::RECEIPT_CODEC,
         &receipt,
         receipt_digest,
-    )?;
-    transaction.commit().map_err(ExternalError::from)?;
+    )
+    .and_then(|()| transaction.commit().map_err(ExternalError::from));
+    drop(phase);
+    persisted?;
     update_state_after_commit(state, commit, ExternalEntryKind::Operation, receipt_digest);
     Ok(ApplyOutcome::Applied(output))
 }
@@ -1505,9 +1513,10 @@ fn reconcile_after_apply<C, O>(
     apply_failed: bool,
 ) -> Result<(), ExternalError>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
     O: DeterministicSqliteOperation,
 {
+    let _phase = InternalSqlitePhase::enter();
     if !conn.is_autocommit() {
         conn.execute_batch("ROLLBACK")?;
     }
@@ -1524,8 +1533,39 @@ where
     Ok(())
 }
 
+/// Opens the [`external_operation_authorizer`] guard for Hiqlite's own
+/// transaction control statements and `_hiqlite_external_*` bookkeeping.
+///
+/// Only ever held while no caller code runs.
+struct InternalSqlitePhase;
+
+impl InternalSqlitePhase {
+    /// # Panics
+    ///
+    /// Panics in debug builds when phases are nested.
+    fn enter() -> Self {
+        let depth = INTERNAL_SQLITE_PHASE.with(|phase| {
+            let depth = phase.get();
+            phase.set(depth + 1);
+            depth
+        });
+        debug_assert_eq!(depth, 0, "internal SQLite phases must never nest");
+        Self
+    }
+}
+
+impl Drop for InternalSqlitePhase {
+    fn drop(&mut self) {
+        INTERNAL_SQLITE_PHASE.with(|phase| phase.set(phase.get().saturating_sub(1)));
+    }
+}
+
 fn external_operation_authorizer(context: AuthContext<'_>) -> Authorization {
     use Authorization::{Allow, Deny};
+
+    if INTERNAL_SQLITE_PHASE.with(|phase| phase.get() > 0) {
+        return Allow;
+    }
 
     let protected = |name: &str| name.starts_with("_hiqlite_external_");
     match context.action {
@@ -1587,7 +1627,7 @@ fn apply_advance<C>(
     commit: ExternalCommit<C>,
 ) -> Result<ApplyOutcome<()>, ExternalError>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
 {
     match classify_commit(
         conn,
@@ -1600,7 +1640,7 @@ where
         CommitClass::New => {}
     }
 
-    let receipt = serialize(&()).map_err(|err| ExternalError::Serialization(err.to_string()))?;
+    let receipt = ().to_external_bytes();
     let receipt_digest = Sha256Digest::of(&receipt);
     let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     persist_new_commit(
@@ -1630,7 +1670,7 @@ fn classify_commit<C>(
     codec: &str,
 ) -> Result<CommitClass<C>, ExternalError>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
 {
     match &state.last_applied {
         None => match commit.sequence.cmp(&state.initial_sequence) {
@@ -1695,10 +1735,9 @@ fn persist_new_commit<C>(
     receipt_digest: Sha256Digest,
 ) -> Result<(), ExternalError>
 where
-    C: Serialize,
+    C: ExternalCodec,
 {
-    let coordinate = serialize(&commit.coordinate)
-        .map_err(|err| ExternalError::Serialization(err.to_string()))?;
+    let coordinate = commit.coordinate.to_external_bytes();
     let floor = commit
         .sequence
         .0
@@ -1731,8 +1770,7 @@ where
         ),
         params![
             encode_u64(commit.sequence.0),
-            serialize(&commit.coordinate)
-                .map_err(|err| ExternalError::Serialization(err.to_string()))?,
+            commit.coordinate.to_external_bytes(),
             commit.command_digest.0.as_slice(),
             kind.as_i64(),
             encode_u64(commit.state_schema),
@@ -1824,7 +1862,7 @@ fn metadata_table_exists(conn: &Connection) -> Result<bool, ExternalError> {
 
 fn load_state<C>(conn: &Connection) -> Result<StoredState<C>, ExternalError>
 where
-    C: Clone + Eq + DeserializeOwned,
+    C: Clone + Eq + ExternalCodec,
 {
     require_metadata_table(conn)?;
     type StateRow = (
@@ -1968,7 +2006,7 @@ fn load_receipt<C>(
     max_receipt_bytes: usize,
 ) -> Result<Option<StoredReceipt<C>>, ExternalError>
 where
-    C: DeserializeOwned,
+    C: ExternalCodec,
 {
     let encoded_size: Option<i64> = conn
         .query_row(
@@ -2080,7 +2118,7 @@ fn validate_configuration<C>(
 
 fn validate_receipts<C, O>(conn: &Connection, state: &StoredState<C>) -> Result<(), ExternalError>
 where
-    C: Clone + Debug + Eq + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
     O: DeterministicSqliteOperation,
 {
     match (&state.last_applied, state.receipt_floor) {
@@ -2167,8 +2205,7 @@ where
                         })?;
                     }
                     ExternalEntryKind::Advance => {
-                        let canonical = serialize(&())
-                            .map_err(|err| ExternalError::Serialization(err.to_string()))?;
+                        let canonical = ().to_external_bytes();
                         if receipt.receipt != canonical {
                             return Err(ExternalError::InvalidMetadata(format!(
                                 "advance receipt at sequence {actual} is not canonical"
@@ -2212,7 +2249,7 @@ fn validate_snapshot_file<C, O>(
     evidence: &ExternalSnapshotEvidence<C>,
 ) -> Result<(), ExternalError>
 where
-    C: Clone + Debug + Eq + Serialize + DeserializeOwned,
+    C: Clone + Debug + Eq + ExternalCodec,
     O: DeterministicSqliteOperation,
 {
     if evidence.format_version != EXTERNAL_FORMAT_VERSION {
@@ -2353,7 +2390,7 @@ fn create_external_snapshot(conn: &Connection, path: &Path) -> Result<(), Extern
     temporary.push("~");
     let temporary = PathBuf::from(temporary);
     let _ = std::fs::remove_file(&temporary);
-    if let Err(err) = conn.backup("main", &temporary, None) {
+    if let Err(err) = conn.backup("main", &temporary, rusqlite::backup::NO_PROGRESS) {
         let _ = std::fs::remove_file(&temporary);
         return Err(err.into());
     }
@@ -2499,11 +2536,9 @@ fn decode_digest(bytes: &[u8], field: &str) -> Result<Sha256Digest, ExternalErro
     Ok(Sha256Digest(bytes))
 }
 
-fn deserialize_exact<T: DeserializeOwned>(bytes: &[u8], field: &str) -> Result<T, ExternalError> {
-    let (value, consumed) =
-        bincode_next::serde::decode_from_slice::<T, _>(bytes, bincode_next::config::legacy())
-            .map_err(|err| ExternalError::Serialization(err.to_string()))?;
-    if consumed != bytes.len() {
+fn deserialize_exact<T: ExternalCodec>(mut bytes: &[u8], field: &str) -> Result<T, ExternalError> {
+    let value = T::decode_from(&mut bytes).map_err(ExternalError::Serialization)?;
+    if !bytes.is_empty() {
         return Err(ExternalError::InvalidMetadata(format!(
             "{field} contains trailing bytes"
         )));
@@ -2547,6 +2582,8 @@ mod tests {
         index: u64,
     }
 
+    crate::external_codec!(Coordinate { term, node, index });
+
     #[derive(Debug)]
     enum TestOperation {
         Create,
@@ -2565,6 +2602,31 @@ mod tests {
         Inserted(i64),
         Deleted(i64),
         Rejected(String),
+    }
+
+    // Hand-written enum codec using the legacy bincode layout (u32 variant tag).
+    impl ExternalCodec for TestReceipt {
+        fn encode_into(&self, out: &mut Vec<u8>) {
+            match self {
+                Self::Created => 0u32.encode_into(out),
+                Self::Inserted(id) => (1u32, *id).encode_into(out),
+                Self::Deleted(id) => (2u32, *id).encode_into(out),
+                Self::Rejected(reason) => {
+                    3u32.encode_into(out);
+                    reason.encode_into(out);
+                }
+            }
+        }
+
+        fn decode_from(input: &mut &[u8]) -> Result<Self, String> {
+            Ok(match u32::decode_from(input)? {
+                0 => Self::Created,
+                1 => Self::Inserted(i64::decode_from(input)?),
+                2 => Self::Deleted(i64::decode_from(input)?),
+                3 => Self::Rejected(String::decode_from(input)?),
+                tag => return Err(format!("unknown test receipt tag {tag}")),
+            })
+        }
     }
 
     #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2645,7 +2707,7 @@ mod tests {
 
         fn encode_receipt(output: &Self::Output) -> Result<Vec<u8>, String> {
             let mut bytes = b"test-receipt-v1\0".to_vec();
-            bytes.extend(serialize(output).map_err(|err| err.to_string())?);
+            output.encode_into(&mut bytes);
             Ok(bytes)
         }
 

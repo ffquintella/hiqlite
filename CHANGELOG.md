@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.16.0
+
+The `cryptr` and `s3-simple` dependencies were pulled in with no `backup` or `s3` targets enabled.
+This is not the case anymore.
+
+The `external-state-machine` feature now comes with its own serialization codec. This mean it does
+not pull in `bincode-next` as a dependency anymore. It is byte-compatible with the bincode legacy
+config that was used up until now, so it's a drop-in replacement.
+
+Apart from that, this release basically only updates dependencies. The dashboard was migrated from
+SvelteKit2 to 3 because of security issues in SvelteKit2, and the underlying `rusqlite` and
+therefore SQLite was bumped to the latest version as well. Even though a `cargo update` was able to
+solve the latest `rustls` security issue in your main app, `hiqlite` pins this now to at least
+`0.23.46` to force it to the fixed version.
+
+The `external-state-machine` writer was adapted to the new `rusqlite` API. The SQLite authorizer
+guard around a caller operation is installed before the transaction is opened, with a short-lived
+internal phase for Hiqlite's own `BEGIN`/`COMMIT` and `_hiqlite_external_*` bookkeeping. Nothing
+changes for implementors of `DeterministicSqliteOperation`.
+
 ## hiqlite-v0.15.3
 
 This version slims down the loaded dependencies when using the `external-state-machine`, and it removes the built-in
@@ -118,17 +138,17 @@ State Machine are fully compatible.
 #### Other Breaking Changes
 
 - The following config vars have been renamed:
-  ```
-  health_check_delay_secs     -> health_check_delay
-  HQL_HEALTH_CHECK_DELAY_SECS -> HQL_HEALTH_CHECK_DELAY
-  backup_keep_days            -> backup_keep_for
-  HQL_BACKUP_KEEP_DAYS        -> HQL_BACKUP_KEEP_FOR
-  backup_keep_days_local      -> backup_keep_for_local
-  HQL_BACKUP_KEEP_DAYS_LOCAL  -> HQL_BACKUP_KEEP_FOR_LOCAL
-  ```
-  Apart from that, all these values are now of type `Duration`. This means you can either provide an Integer, and they
-  will be interpreted as seconds, or you provide them as a String like '120s', '2m', '3h', ..., and they will be parsed
-  with the given unit. The available units are: `s, m, h, d, w, y`.
+    ```
+    health_check_delay_secs     -> health_check_delay
+    HQL_HEALTH_CHECK_DELAY_SECS -> HQL_HEALTH_CHECK_DELAY
+    backup_keep_days            -> backup_keep_for
+    HQL_BACKUP_KEEP_DAYS        -> HQL_BACKUP_KEEP_FOR
+    backup_keep_days_local      -> backup_keep_for_local
+    HQL_BACKUP_KEEP_DAYS_LOCAL  -> HQL_BACKUP_KEEP_FOR_LOCAL
+    ```
+    Apart from that, all these values are now of type `Duration`. This means you can either provide an Integer, and they
+    will be interpreted as seconds, or you provide them as a String like '120s', '2m', '3h', ..., and they will be parsed
+    with the given unit. The available units are: `s, m, h, d, w, y`.
 - The `listen_notify_local` feature was dropped and folded into `listen_notify`. The `*_local` feature only existed
   to prevent the `eventsource-client` from being pulled in, which was needed for remote-only clients. The connection
   type was reworked from SEE (b64 encoded text data) into raw binary over WebSocket, which is much faster and more
@@ -339,7 +359,7 @@ impl From<&mut hiqlite::Row<'_>> for MyStruct {
 }
 ```
 
-This migration is easily done with 2 global *find and replace*:
+This migration is easily done with 2 global _find and replace_:
 
 - rename all `impl From<hiqlite::Row<'_>> for` to `impl From<&mut hiqlite::Row<'_>>`
 - rename all `fn from(mut row: hiqlite::Row<'_>) -> Self {` to `fn from(row: &mut hiqlite::Row<'_>) -> Self {`
@@ -624,47 +644,47 @@ do so, it is important however to not have too high `periodSeconds`, and the `he
 apiVersion: v1
 kind: Service
 metadata:
-  name: hiqlite-headless
-  namespace: hiqlite
+    name: hiqlite-headless
+    namespace: hiqlite
 spec:
-  clusterIP: None
-  # only do that on the headless service
-  publishNotReadyAddresses: true
-  selector:
-    app: hiqlite
-  ports:
-    - name: raft
-      protocol: TCP
-      port: 8100
-      targetPort: 8100
-    - name: api
-      protocol: TCP
-      port: 8200
-      targetPort: 8200
+    clusterIP: None
+    # only do that on the headless service
+    publishNotReadyAddresses: true
+    selector:
+        app: hiqlite
+    ports:
+        - name: raft
+          protocol: TCP
+          port: 8100
+          targetPort: 8100
+        - name: api
+          protocol: TCP
+          port: 8200
+          targetPort: 8200
 ```
 
 Then you can make use of the new readiness check in the `StatefulSet`:
 
 ```yaml
 readinessProbe:
-  httpGet:
-    scheme: HTTP
-    port: 8200
-    path: /ready
-  initialDelaySeconds: 5
-  # Do not increase, otherwise a shutdown might start before k8s catches it.
-  periodSeconds: 3
-  # Require 2 failures because you may get one during a leader switch.
-  failureThreshold: 2
-livenessProbe:
-  httpGet:
-    scheme: HTTP
-    port: 8200
-    path: /health
-    initialDelaySeconds: 60
-    periodSeconds: 30
+    httpGet:
+        scheme: HTTP
+        port: 8200
+        path: /ready
+    initialDelaySeconds: 5
+    # Do not increase, otherwise a shutdown might start before k8s catches it.
+    periodSeconds: 3
     # Require 2 failures because you may get one during a leader switch.
     failureThreshold: 2
+livenessProbe:
+    httpGet:
+        scheme: HTTP
+        port: 8200
+        path: /health
+        initialDelaySeconds: 60
+        periodSeconds: 30
+        # Require 2 failures because you may get one during a leader switch.
+        failureThreshold: 2
 ```
 
 ### Bugfix
@@ -1067,7 +1087,7 @@ Raft logs batch. This is a pretty big tradeoff but may be necessary in some situ
 # The default is `false`, and a flush + sync will be done in 200ms
 # intervals. Even if the application should crash, the OS will take
 # care of flushing left-over buffers to disk and no data will get
-# lost. If something worse happens, you might lose the last 200ms 
+# lost. If something worse happens, you might lose the last 200ms
 # of commits (on that node, not the whole cluster). This is only
 # important to know for single instance deployments. HA nodes will
 # sync data from other cluster members after a restart anyway.
@@ -1143,7 +1163,7 @@ places.
       The additional `chrono` and `serde_json` types are stored as `TEXT` inside the DB for compatibility with the
       underlying `rusqlite` crate. Using `INTEGER` for `chrono::Naive*` and `Utc` types would be faster more efficient,
       which may be changed in the future. For now, all Date and Time-like types are converted to `TEXT`.  
-      *Note:* These auto type conversions only work when you implement the `From<hiqlite::Row>` and do not work with the
+      _Note:_ These auto type conversions only work when you implement the `From<hiqlite::Row>` and do not work with the
       auto-conversion from deriving `serde::Deserialize`.
 - `openraft` has been bumped to `v0.9.16` which solves some issues with a not-so-pretty rolling restart of Kubernetes
   StatefulSets for instance due to a race condition.
