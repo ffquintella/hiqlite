@@ -309,7 +309,9 @@ impl StateMachineMemory {
             // same normalized form as a fresh startup, and this file is the "cache data was
             // started on >= v0.15" marker that `v0_15_auto_cache_migration` relies on.
             let normalized = C::hiqlite_cache_variants_normalized();
-            if !fs::try_exists(&path_meta).await? || stored.as_bytes() != normalized.as_bytes() {
+            if !fs::try_exists(&path_meta).await?
+                || stored.as_deref().map(str::as_bytes) != Some(normalized.as_bytes())
+            {
                 let path_temp = format!("{path_meta}~");
                 {
                     let mut file = fs::File::create(&path_temp).await.map_err(|err| {
